@@ -152,12 +152,7 @@ async def proxy_streaming(request: web.Request, target_url: str, body: bytes,
                         )
                         if total_input > 0:
                             session_state["last_input_tokens"] = total_input
-                            log.info(
-                                f"Tracked tokens from stream: {total_input:,} total "
-                                f"(uncached={usage.get('input_tokens', 0)}, "
-                                f"cache_create={usage.get('cache_creation_input_tokens', 0)}, "
-                                f"cache_read={usage.get('cache_read_input_tokens', 0)})"
-                            )
+                            log.debug(f"Tracked {total_input:,} input tokens from stream")
                         break
             except Exception:
                 pass
@@ -211,10 +206,9 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     estimated = compressor.estimate_tokens(messages)
     if session_state["last_input_tokens"] > 0:
         token_count = session_state["last_input_tokens"]
-        log.info(f"Token count: ~{token_count:,} (API-reported), estimate={estimated:,}, messages={len(messages)}")
     else:
         token_count = estimated
-        log.info(f"Token count: ~{token_count:,} (estimated), messages={len(messages)}")
+    log.debug(f"Token count: ~{token_count:,}, estimate={estimated:,}, messages={len(messages)}")
 
     # Apply pending compression if available
     if session_state["pending"] is not None:
@@ -261,7 +255,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # Forward immediately — never block
     body = json.dumps(payload).encode("utf-8")
     headers = _forward_headers(request, body)
-    target_url = f"{UPSTREAM_URL}/v1/messages"
+    target_url = f"{UPSTREAM_URL}{request.path_qs}"
 
     tracker.cleanup_stale()
 
@@ -274,7 +268,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 async def handle_passthrough(request: web.Request) -> web.StreamResponse:
     raw_body = await request.read()
     headers = _forward_headers(request)
-    target_url = f"{UPSTREAM_URL}{request.path}"
+    target_url = f"{UPSTREAM_URL}{request.path_qs}"
 
     async with aiohttp.ClientSession() as session:
         async with session.request(
