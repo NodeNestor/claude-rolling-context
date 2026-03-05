@@ -137,17 +137,27 @@ async def proxy_streaming(request: web.Request, target_url: str, body: bytes,
                 await response.write(chunk)
                 buffer += chunk
 
-            # Try to extract input_tokens from the final SSE message_stop event
+            # Extract input_tokens from the message_start SSE event
+            # With prompt caching (beta=true), total = input_tokens + cache_creation + cache_read
             try:
                 text = buffer.decode("utf-8", errors="replace")
-                for line in reversed(text.split("\n")):
-                    if line.startswith("data: ") and '"usage"' in line:
+                for line in text.split("\n"):
+                    if line.startswith("data: ") and '"message_start"' in line:
                         data = json.loads(line[6:])
-                        usage = data.get("usage", {})
-                        input_tokens = usage.get("input_tokens", 0)
-                        if input_tokens > 0:
-                            session_state["last_input_tokens"] = input_tokens
-                            log.debug(f"Tracked input_tokens from response: {input_tokens:,}")
+                        usage = data.get("message", {}).get("usage", {})
+                        total_input = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                        )
+                        if total_input > 0:
+                            session_state["last_input_tokens"] = total_input
+                            log.info(
+                                f"Tracked tokens from stream: {total_input:,} total "
+                                f"(uncached={usage.get('input_tokens', 0)}, "
+                                f"cache_create={usage.get('cache_creation_input_tokens', 0)}, "
+                                f"cache_read={usage.get('cache_read_input_tokens', 0)})"
+                            )
                         break
             except Exception:
                 pass
@@ -162,12 +172,17 @@ async def proxy_non_streaming(request: web.Request, target_url: str, body: bytes
         async with session.post(target_url, data=body, headers=headers) as upstream:
             resp_body = await upstream.read()
 
-            # Extract input_tokens from response
+            # Extract input_tokens from response (handle prompt caching)
             try:
                 data = json.loads(resp_body)
-                input_tokens = data.get("usage", {}).get("input_tokens", 0)
-                if input_tokens > 0:
-                    session_state["last_input_tokens"] = input_tokens
+                usage = data.get("usage", {})
+                total_input = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                )
+                if total_input > 0:
+                    session_state["last_input_tokens"] = total_input
             except Exception:
                 pass
 
@@ -193,11 +208,13 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
     # Use the accurate token count from last API response if available,
     # otherwise fall back to our rough estimate
+    estimated = compressor.estimate_tokens(messages)
     if session_state["last_input_tokens"] > 0:
         token_count = session_state["last_input_tokens"]
-        log.debug(f"Using API-reported token count: {token_count:,}")
+        log.info(f"Token count: ~{token_count:,} (API-reported), estimate={estimated:,}, messages={len(messages)}")
     else:
-        token_count = compressor.estimate_tokens(messages)
+        token_count = estimated
+        log.info(f"Token count: ~{token_count:,} (estimated), messages={len(messages)}")
 
     # Apply pending compression if available
     if session_state["pending"] is not None:
@@ -216,11 +233,13 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             session_state["last_input_tokens"] = 0
 
     # Trigger background compression if over threshold
+    # Use message estimate (excludes system prompt) to avoid spurious triggers
+    msg_estimate = compressor.estimate_tokens(payload.get("messages", messages))
     already_compressing = (
         session_state["task"] is not None
         and not session_state["task"].done()
     )
-    if token_count > TRIGGER_TOKENS and not already_compressing:
+    if token_count > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
         log.info(
             f"Context at ~{token_count:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
             f"Compressing in background..."

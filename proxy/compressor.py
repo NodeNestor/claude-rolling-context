@@ -15,6 +15,7 @@ import aiohttp
 log = logging.getLogger("rolling-context.compressor")
 
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL", "https://api.anthropic.com")
+SUMMARIZER_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Aim for ~25% compression ratio: summary ≈ 1/4 of input tokens
 SUMMARY_RATIO = float(os.environ.get("ROLLING_CONTEXT_SUMMARY_RATIO", "0.25"))
@@ -228,8 +229,12 @@ class RollingCompressor:
         })
         headers = {
             "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
         }
-        headers.update(auth_headers)
+        if SUMMARIZER_API_KEY:
+            headers["x-api-key"] = SUMMARIZER_API_KEY
+        else:
+            headers.update(auth_headers)
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
