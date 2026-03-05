@@ -1,7 +1,11 @@
 {
   "name": "rolling-context",
-  "version": "0.1.0",
-  "description": "Rolling context compression for Claude Code. Keeps a compressed summary of old messages + recent messages verbatim. Never lose context, never hit the wall.",
+  "version": "1.0.0",
+  "description": "Rolling context compression — old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
+  "author": {
+    "name": "NodeNestor"
+  },
+  "homepage": "https://github.com/NodeNestor/claude-rolling-context",
   "hooks": {
     "SessionStart": [
       {
