@@ -30,7 +30,7 @@ UPSTREAM_URL = os.environ.get("ROLLING_CONTEXT_UPSTREAM", "https://api.anthropic
 LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT", "5588"))
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER", "80000"))
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET", "40000"))
-SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL", "claude-haiku-latest")
+SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
 
 compressor = RollingCompressor(
     trigger_tokens=TRIGGER_TOKENS,
@@ -44,7 +44,7 @@ class SessionTracker:
     a fingerprint of the first user message (unique per conversation)."""
 
     def __init__(self):
-        self._sessions = {}  # fingerprint -> {pending, task, last_input_tokens}
+        self._sessions = {}  # fingerprint -> {pending, pending_msg_count, task, last_input_tokens}
 
     def _fingerprint(self, messages: list) -> str:
         """Hash the first user message content to identify the session."""
@@ -60,9 +60,10 @@ class SessionTracker:
         fp = self._fingerprint(messages)
         if fp not in self._sessions:
             self._sessions[fp] = {
-                "pending": None,        # Compressed messages ready to apply
-                "task": None,           # Running asyncio compression task
-                "last_input_tokens": 0, # From last API response
+                "pending": None,          # Compressed messages ready to apply
+                "pending_msg_count": 0,   # How many messages were in the array when compression started
+                "task": None,             # Running asyncio compression task
+                "last_input_tokens": 0,   # From last API response
             }
         return self._sessions[fp]
 
@@ -91,28 +92,27 @@ def _forward_headers(request: web.Request, body: bytes = None) -> dict:
     return headers
 
 
-def get_auth_headers(request: web.Request) -> dict:
-    """Extract auth headers from the request to reuse for summarization calls.
-    Forwards whatever auth the client sent — API key, OAuth, anything."""
+def get_passthrough_headers(request: web.Request) -> dict:
+    """Capture all headers from the request to reuse for summarization calls.
+    Same auth, same everything — just like a normal passthrough."""
     headers = {}
-    if request.headers.get("x-api-key"):
-        headers["x-api-key"] = request.headers["x-api-key"]
-    if request.headers.get("Authorization"):
-        headers["Authorization"] = request.headers["Authorization"]
-    if request.headers.get("anthropic-version"):
-        headers["anthropic-version"] = request.headers["anthropic-version"]
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower not in ("host", "content-length", "transfer-encoding"):
+            headers[key] = value
     return headers
 
 
-async def _do_background_compression(session_state: dict, messages: list, auth_headers: dict):
+async def _do_background_compression(session_state: dict, messages: list, msg_count: int, auth_headers: dict):
     """Run compression in background. Stores result in session state."""
     try:
         compressed = await compressor.compress(messages, auth_headers)
         session_state["pending"] = compressed
+        session_state["pending_msg_count"] = msg_count
         log.info(
             f"Background compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
-            f"({len(compressed)} messages)"
+            f"({len(compressed)} messages, based on {msg_count} original)"
         )
     except Exception as e:
         log.error(f"Background compression failed: {e}")
@@ -195,7 +195,7 @@ async def proxy_non_streaming(request: web.Request, target_url: str, body: bytes
 
 async def handle_messages(request: web.Request) -> web.StreamResponse:
     raw_body = await request.read()
-    auth_headers = get_auth_headers(request)
+    auth_headers = get_passthrough_headers(request)
 
     try:
         payload = json.loads(raw_body)
@@ -219,22 +219,30 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # Apply pending compression if available
     if session_state["pending"] is not None:
         compressed = session_state["pending"]
+        original_count = session_state["pending_msg_count"]
         session_state["pending"] = None
-        compressed_tokens = compressor.estimate_tokens(compressed)
+        session_state["pending_msg_count"] = 0
 
-        if compressed_tokens < token_count:
+        # Append any messages that arrived after compression was triggered
+        new_messages = messages[original_count:] if original_count < len(messages) else []
+        merged = compressed + new_messages
+        merged_tokens = compressor.estimate_tokens(merged)
+
+        if merged_tokens < token_count:
             log.info(
-                f"Applying compression: ~{token_count:,} -> ~{compressed_tokens:,} tokens "
-                f"({len(messages)} -> {len(compressed)} messages)"
+                f"Applying compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
+                f"({len(messages)} -> {len(merged)} messages, "
+                f"{len(new_messages)} new messages appended)"
             )
-            payload["messages"] = compressed
-            token_count = compressed_tokens
+            payload["messages"] = merged
+            token_count = merged_tokens
             # Reset tracked tokens since we changed the messages
             session_state["last_input_tokens"] = 0
 
     # Trigger background compression if over threshold
-    # Use message estimate (excludes system prompt) to avoid spurious triggers
-    msg_estimate = compressor.estimate_tokens(payload.get("messages", messages))
+    # Recalculate estimate on current payload (may have been compressed above)
+    current_messages = payload.get("messages", messages)
+    msg_estimate = compressor.estimate_tokens(current_messages)
     already_compressing = (
         session_state["task"] is not None
         and not session_state["task"].done()
@@ -246,7 +254,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         )
         session_state["task"] = asyncio.create_task(
             _do_background_compression(
-                session_state, payload.get("messages", messages), auth_headers
+                session_state, current_messages, len(current_messages), auth_headers
             )
         )
 

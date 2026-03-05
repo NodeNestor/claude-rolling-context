@@ -15,7 +15,6 @@ import aiohttp
 log = logging.getLogger("rolling-context.compressor")
 
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL", "https://api.anthropic.com")
-SUMMARIZER_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # Aim for ~25% compression ratio: summary ≈ 1/4 of input tokens
 SUMMARY_RATIO = float(os.environ.get("ROLLING_CONTEXT_SUMMARY_RATIO", "0.25"))
@@ -98,15 +97,22 @@ class RollingCompressor:
 
     def _find_keep_index(self, messages: list) -> int:
         """Walk backwards from end, keeping messages until we hit target_tokens.
-        Snaps to user message boundaries so we don't split turns."""
+        Snaps to user message boundaries so we don't split turns.
+        Always keeps at least the last 4 messages (2 exchanges)."""
+        if len(messages) <= 4:
+            return 0
+        max_idx = len(messages) - 4  # Never return higher than this
         accumulated = 0
         for i in range(len(messages) - 1, -1, -1):
             msg_tokens = self.estimate_tokens([messages[i]])
             if accumulated + msg_tokens > self.target_tokens:
+                # Find the next user message boundary
+                idx = i + 1
                 for j in range(i + 1, len(messages)):
                     if messages[j].get("role") == "user":
-                        return j
-                return i + 1
+                        idx = j
+                        break
+                return min(idx, max_idx)
             accumulated += msg_tokens
         return 0
 
@@ -227,18 +233,13 @@ class RollingCompressor:
             "max_tokens": summary_max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         })
-        headers = {
-            "content-type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
-        if SUMMARIZER_API_KEY:
-            headers["x-api-key"] = SUMMARIZER_API_KEY
-        else:
-            headers.update(auth_headers)
+        # Use the exact same headers as the original request — same auth, same everything
+        headers = dict(auth_headers)
+        headers["content-length"] = str(len(req_body))
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{SUMMARIZER_BASE_URL}/v1/messages",
+                f"{SUMMARIZER_BASE_URL}/v1/messages?beta=true",
                 data=req_body,
                 headers=headers,
             ) as resp:

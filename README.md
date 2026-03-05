@@ -46,7 +46,6 @@ All settings via environment variables:
 | `ROLLING_CONTEXT_MODEL` | `claude-haiku-latest` | Model used for summarization |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
 | `ROLLING_CONTEXT_SUMMARIZER_URL` | `https://api.anthropic.com` | Where Haiku summarization calls go |
-| `ANTHROPIC_API_KEY` | *(none)* | API key for summarization calls. **Required** if Claude Code uses OAuth (which it does by default). Haiku summarization is very cheap (~$0.001/compression). |
 
 ## How It Compresses
 
