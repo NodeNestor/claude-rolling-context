@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
-test/workspace/
+test/
