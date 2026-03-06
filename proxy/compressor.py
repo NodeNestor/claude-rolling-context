@@ -16,8 +16,6 @@ from urllib.request import Request, urlopen
 log = logging.getLogger("rolling-context.compressor")
 
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL", "https://api.anthropic.com")
-SUMMARY_RATIO = float(os.environ.get("ROLLING_CONTEXT_SUMMARY_RATIO", "0.25"))
-
 ssl_ctx = ssl.create_default_context()
 
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
@@ -218,11 +216,7 @@ class RollingCompressor:
 
         conversation_text = self._messages_to_text(to_compress)
 
-        input_chars = self._count_chars(to_compress)
-        if existing_summary:
-            input_chars += len(existing_summary)
-        # chars/2 ≈ real tokens (chars/4 underestimates by ~2x)
-        summary_max_tokens = max(2000, min(16000, int((input_chars // 2) * SUMMARY_RATIO)))
+        summary_max_tokens = 16000
 
         existing_section = ""
         if existing_summary:
