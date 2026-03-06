@@ -391,7 +391,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 payload["messages"] = merged
                 token_count = merged_tokens
-                session_state["last_input_tokens"] = 0
             else:
                 log.info(
                     f"[MSG] Compression no longer helps: merged={merged_tokens:,} >= current={token_count:,}, clearing"
@@ -399,14 +398,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 session_state["compressed_prefix"] = None
                 session_state["compressed_msg_count"] = 0
 
-        # Trigger background compression
+        # Trigger background compression — use API-reported tokens if available
         current_messages = payload.get("messages", messages)
         msg_estimate = compressor.estimate_tokens(current_messages)
         already_compressing = session_state["thread"] is not None and session_state["thread"].is_alive()
+        trigger_tokens = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else token_count
 
-        if token_count > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
+        if trigger_tokens > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
             log.info(
-                f"[MSG] Context at ~{token_count:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
+                f"[MSG] Context at ~{trigger_tokens:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
                 f"Compressing in background..."
             )
             t = threading.Thread(
@@ -418,7 +418,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             session_state["thread"] = t
         else:
             log.debug(
-                f"[MSG] No compression needed: tokens={token_count:,} "
+                f"[MSG] No compression needed: trigger_tokens={trigger_tokens:,} "
                 f"trigger={TRIGGER_TOKENS:,} est={msg_estimate:,} compressing={already_compressing}"
             )
 
