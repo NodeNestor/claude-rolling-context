@@ -234,7 +234,7 @@ class RollingCompressor:
         )
 
         log.info(
-            f"Summarizing {len(to_compress)} messages ({input_chars:,} chars) "
+            f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
             f"with {self.summarizer_model} (max_tokens={summary_max_tokens:,})..."
         )
 
