@@ -1,12 +1,12 @@
 {
-  "description": "Rolling Context - auto-start proxy on session start",
+  "description": "Rolling Context - auto-start proxy before first message",
   "hooks": {
-    "SessionStart": [
+    "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.ps1\" 2>/dev/null || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.sh\" 2>/dev/null",
+            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/on-prompt.ps1\" 2>/dev/null || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-prompt.sh\" 2>/dev/null",
             "timeout": 30
           }
         ]
