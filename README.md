@@ -27,6 +27,8 @@ Instead of Claude Code's built-in `/compact` (which replaces **everything** with
 
 ## Install
 
+### Option 1: One-line install (recommended)
+
 **Linux / macOS:**
 ```bash
 git clone https://github.com/NodeNestor/claude-rolling-context.git ~/claude-rolling-context
@@ -47,6 +49,29 @@ The installer:
 - Registers as a Claude Code plugin (auto-starts proxy on session start)
 
 Restart your terminal and you're done. The proxy starts automatically when Claude Code launches.
+
+### Option 2: Claude Code Plugin Marketplace
+
+You can also add this repo as a plugin marketplace directly in Claude Code:
+
+```
+/plugin marketplace add https://github.com/NodeNestor/claude-rolling-context
+/plugin install rolling-context
+```
+
+Then set the environment variable so Claude Code routes through the proxy:
+
+**Linux / macOS** — add to your `~/.bashrc` or `~/.zshrc`:
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:5588
+```
+
+**Windows (PowerShell):**
+```powershell
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://127.0.0.1:5588", "User")
+```
+
+Restart your terminal. The proxy auto-starts on each Claude Code session via the plugin hook.
 
 ## Configuration
 
