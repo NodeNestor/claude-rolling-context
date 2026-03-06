@@ -227,6 +227,7 @@ class RollingCompressor:
 
         headers = dict(auth_headers)
         headers["content-length"] = str(len(req_body))
+        headers["accept-encoding"] = "identity"
 
         req = Request(
             f"{SUMMARIZER_BASE_URL}/v1/messages?beta=true",
