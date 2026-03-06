@@ -230,12 +230,23 @@ def _do_background_compression(entry: dict, messages: list, original_hashes: lis
     )
     try:
         compressed = compressor.compress(messages, auth_headers)
+        # Only store hashes for messages that were actually compressed away.
+        # compressed = [summary, ack] + recent_messages
+        # recent_count = len(compressed) - 2 (summary + ack)
+        # compressed_away = len(messages) - recent_count
+        # We only need to match the compressed-away portion in original_hashes
+        recent_count = len(compressed) - 2
+        compressed_away = len(messages) - recent_count
+        # Map back to original hashes: only the first N that were compressed
+        stable_hashes = original_hashes[:compressed_away] if compressed_away < len(original_hashes) else original_hashes
         entry["pending"] = compressed
-        entry["pending_hashes"] = original_hashes
+        entry["pending_hashes"] = stable_hashes
         log.info(
             f"[BG] Compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
-            f"({len(compressed)} messages, covers {len(original_hashes)} originals)"
+            f"({len(compressed)} messages, "
+            f"compressed {compressed_away} originals, "
+            f"keeping {recent_count} recent verbatim)"
         )
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
