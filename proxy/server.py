@@ -233,11 +233,11 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-def _do_background_compression(entry: dict, messages: list, auth_headers: dict):
+def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
-        compressed = compressor.compress(messages, auth_headers)
+        compressed = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
         # compressed = [summary, ack] + recent_verbatim
         # The recent messages are kept verbatim in the prefix.
         # Key = only the messages that were actually summarized away.
@@ -546,23 +546,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Trigger compression based on REAL token count from API response
             if total_input > 0 and total_input > TRIGGER_TOKENS:
-                msg_estimate = compressor.estimate_tokens(current_messages)
                 already_compressing = any(
                     e["thread"] is not None and e["thread"].is_alive()
                     for e in store.compressions
                 )
-                if msg_estimate > TARGET_TOKENS and not already_compressing:
+                if not already_compressing:
                     log.info(
                         f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
                         f"Compressing in background..."
                     )
-                    if match:
-                        entry = match
-                    else:
-                        entry = store.add()
+                    entry = store.add()
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),
+                        kwargs={"real_token_count": total_input},
                         daemon=True,
                     )
                     t.start()

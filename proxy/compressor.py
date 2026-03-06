@@ -95,14 +95,16 @@ class RollingCompressor:
                                         total_chars += len(sub.get("text", ""))
         return total_chars // 4
 
-    def _find_keep_index(self, messages: list) -> int:
+    def _find_keep_index(self, messages: list, target: int = None) -> int:
+        if target is None:
+            target = self.target_tokens
         if len(messages) <= 4:
             return 0
         max_idx = len(messages) - 4
         accumulated = 0
         for i in range(len(messages) - 1, -1, -1):
             msg_tokens = self.estimate_tokens([messages[i]])
-            if accumulated + msg_tokens > self.target_tokens:
+            if accumulated + msg_tokens > target:
                 for j in range(i + 1, len(messages)):
                     if messages[j].get("role") == "user":
                         if not self._has_tool_result(messages[j]):
@@ -174,9 +176,21 @@ class RollingCompressor:
             parts.append(f"**{role}**: {text}")
         return "\n\n".join(parts)
 
-    def compress(self, messages: list, auth_headers: dict) -> list:
+    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> list:
         """Compress messages using rolling summarization (synchronous)."""
-        keep_from_idx = self._find_keep_index(messages)
+        # Scale target using real API token count vs our estimate
+        effective_target = self.target_tokens
+        if real_token_count:
+            estimated = self.estimate_tokens(messages)
+            if estimated > 0:
+                ratio = real_token_count / estimated
+                effective_target = int(self.target_tokens / ratio)
+                log.info(
+                    f"Token scaling: real={real_token_count:,} est={estimated:,} "
+                    f"ratio={ratio:.1f}x, effective_target={effective_target:,}"
+                )
+
+        keep_from_idx = self._find_keep_index(messages, effective_target)
 
         has_existing_summary = self._has_summary(messages)
         start_idx = 2 if has_existing_summary else 0
