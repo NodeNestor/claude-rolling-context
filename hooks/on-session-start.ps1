@@ -1,5 +1,5 @@
 # Auto-start the rolling context proxy if it's not already running (Windows)
-# Also ensures ANTHROPIC_BASE_URL is set for future sessions.
+# Handles chaining: if ANTHROPIC_BASE_URL already points elsewhere, sets that as upstream.
 
 $ErrorActionPreference = "SilentlyContinue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -10,11 +10,15 @@ $LogFile = Join-Path $ClaudeDir "rolling-context-proxy.log"
 $Port = if ($env:ROLLING_CONTEXT_PORT) { $env:ROLLING_CONTEXT_PORT } else { "5588" }
 $ProxyUrl = "http://127.0.0.1:$Port"
 
-# Ensure ANTHROPIC_BASE_URL is set for future sessions
+# Handle ANTHROPIC_BASE_URL chaining
 $currentUrl = [Environment]::GetEnvironmentVariable("ANTHROPIC_BASE_URL", "User")
 if (-not $currentUrl) {
+    # Not set at all — just set it to our proxy
     [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
-    Write-Host "Rolling context: set ANTHROPIC_BASE_URL=$ProxyUrl (restart terminal to activate)"
+} elseif ($currentUrl -notmatch "127\.0\.0\.1.*$Port") {
+    # Set to something else (another proxy/router) — chain through it
+    [Environment]::SetEnvironmentVariable("ROLLING_CONTEXT_UPSTREAM", $currentUrl, "User")
+    [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
 }
 
 # Check if proxy is already running via PID
@@ -33,41 +37,19 @@ try {
     if ($response.StatusCode -eq 200) { exit 0 }
 } catch {}
 
-# Set up venv if needed
-Push-Location $ProxyDir
-if (-not (Test-Path "venv\Scripts\python.exe")) {
-    try {
-        python -m venv venv 2>&1 | Out-Null
-        & .\venv\Scripts\pip.exe install -q -r requirements.txt 2>&1 | Out-Null
-    } catch {
-        Write-Host "Rolling context: failed to create venv"
-        Pop-Location
-        exit 1
-    }
+# Set up venv if needed, then start proxy — all in background to avoid timeout
+$setupScript = @"
+Set-Location '$ProxyDir'
+if (-not (Test-Path 'venv\Scripts\python.exe')) {
+    python -m venv venv 2>&1 | Out-Null
+    .\venv\Scripts\pip.exe install -q -r requirements.txt 2>&1 | Out-Null
 }
+`$proc = Start-Process -FilePath '.\venv\Scripts\python.exe' -ArgumentList 'server.py' ``
+    -RedirectStandardOutput '$LogFile' -RedirectStandardError '$LogFile.err' ``
+    -WindowStyle Hidden -PassThru
+`$proc.Id | Out-File -FilePath '$PidFile' -NoNewline
+"@
 
-# Start the proxy in the background
-try {
-    $proc = Start-Process -FilePath ".\venv\Scripts\python.exe" -ArgumentList "server.py" `
-        -RedirectStandardOutput $LogFile -RedirectStandardError "$LogFile.err" `
-        -WindowStyle Hidden -PassThru
-    $proc.Id | Out-File -FilePath $PidFile -NoNewline
-} catch {
-    Write-Host "Rolling context: failed to start proxy"
-    Pop-Location
-    exit 1
-}
-Pop-Location
-
-# Wait and verify
-Start-Sleep -Seconds 2
-try {
-    $response = Invoke-WebRequest -Uri "$ProxyUrl/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-    if ($response.StatusCode -eq 200) {
-        Write-Host "Rolling context proxy started on port $Port"
-    }
-} catch {
-    Write-Host "Warning: Rolling context proxy may not have started correctly. Check $LogFile"
-}
+Start-Process -FilePath "powershell" -ArgumentList "-ExecutionPolicy", "Bypass", "-Command", $setupScript -WindowStyle Hidden
 
 exit 0
