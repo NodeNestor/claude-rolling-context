@@ -1,18 +1,7 @@
 {
-  "description": "Rolling Context - auto-start proxy on session start, ensure running on each prompt",
+  "description": "Rolling Context - auto-start proxy on session start",
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/on-prompt.ps1\" 2>/dev/null || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-prompt.sh\" 2>/dev/null",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
       {
         "hooks": [
           {
