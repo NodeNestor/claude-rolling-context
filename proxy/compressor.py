@@ -221,7 +221,8 @@ class RollingCompressor:
         input_chars = self._count_chars(to_compress)
         if existing_summary:
             input_chars += len(existing_summary)
-        summary_max_tokens = max(2000, min(16000, int((input_chars // 4) * SUMMARY_RATIO)))
+        # chars/2 ≈ real tokens (chars/4 underestimates by ~2x)
+        summary_max_tokens = max(2000, min(16000, int((input_chars // 2) * SUMMARY_RATIO)))
 
         existing_section = ""
         if existing_summary:
@@ -305,7 +306,7 @@ class RollingCompressor:
                 f"summary={summary_chars:,} chars, recent={recent_chars:,} chars)"
             )
         else:
-            self.total_tokens_saved += (original_chars - compressed_chars) // 4
+            self.total_tokens_saved += (original_chars - compressed_chars) // 2
             log.info(
                 f"Compression #{self.compression_count}: "
                 f"{original_chars:,} -> {compressed_chars:,} chars "
