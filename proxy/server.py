@@ -15,9 +15,9 @@ import sys
 import logging
 import threading
 import ssl
+import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.parse import urlparse
 
 from compressor import RollingCompressor
 
@@ -34,8 +34,8 @@ TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER", "80000"))
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET", "40000"))
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
 
-# SSL context for upstream HTTPS requests
 ssl_ctx = ssl.create_default_context()
+_parsed_upstream = urlparse(UPSTREAM_URL)
 
 compressor = RollingCompressor(
     trigger_tokens=TRIGGER_TOKENS,
@@ -44,9 +44,24 @@ compressor = RollingCompressor(
 )
 
 
-class SessionTracker:
-    """Tracks compression state per session."""
+def _upstream_conn():
+    """Create a connection to the upstream server."""
+    if _parsed_upstream.scheme == "https":
+        return http.client.HTTPSConnection(
+            _parsed_upstream.hostname,
+            _parsed_upstream.port or 443,
+            context=ssl_ctx,
+            timeout=600,
+        )
+    else:
+        return http.client.HTTPConnection(
+            _parsed_upstream.hostname,
+            _parsed_upstream.port or 80,
+            timeout=600,
+        )
 
+
+class SessionTracker:
     def __init__(self):
         self._sessions = {}
         self._lock = threading.Lock()
@@ -75,10 +90,10 @@ class SessionTracker:
     def cleanup_stale(self, max_sessions: int = 50):
         with self._lock:
             if len(self._sessions) > max_sessions:
-                to_remove = []
-                for fp, state in self._sessions.items():
-                    if state["pending"] is None and (state["thread"] is None or not state["thread"].is_alive()):
-                        to_remove.append(fp)
+                to_remove = [
+                    fp for fp, state in self._sessions.items()
+                    if state["pending"] is None and (state["thread"] is None or not state["thread"].is_alive())
+                ]
                 for fp in to_remove[:len(self._sessions) - max_sessions]:
                     del self._sessions[fp]
 
@@ -142,7 +157,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
     """Handle HTTP requests, proxy to upstream API."""
     protocol_version = "HTTP/1.1"
 
-    # Suppress default access log
     def log_message(self, format, *args):
         pass
 
@@ -153,52 +167,62 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _get_headers_dict(self) -> dict:
         return {key: value for key, value in self.headers.items()}
 
-    def _proxy_request(self, method: str):
-        """Generic proxy for non-messages endpoints."""
+    def _proxy_raw(self, method: str):
+        """Raw proxy — forward request and stream response back."""
         body = self._read_body()
         headers = _forward_headers(self._get_headers_dict(), body if body else None)
-        target_url = f"{UPSTREAM_URL}{self.path}"
 
         try:
-            req = Request(target_url, data=body if body else None, headers=headers, method=method)
-            with urlopen(req, context=ssl_ctx, timeout=300) as resp:
-                resp_body = resp.read()
-                self.send_response(resp.status)
-                for key, value in resp.getheaders():
-                    if key.lower() not in ("transfer-encoding", "content-encoding", "connection"):
-                        self.send_header(key, value)
-                self.end_headers()
-                self.wfile.write(resp_body)
-        except URLError as e:
+            conn = _upstream_conn()
+            conn.request(method, self.path, body=body if body else None, headers=headers)
+            resp = conn.getresponse()
+
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                if key.lower() not in ("transfer-encoding", "connection"):
+                    self.send_header(key, value)
+            self.end_headers()
+
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+            conn.close()
+        except Exception as e:
             log.error(f"Upstream error: {e}")
+            error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(error_body)))
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(error_body)
 
     def do_GET(self):
         if self.path == "/health":
             self._handle_health()
         else:
-            self._proxy_request("GET")
+            self._proxy_raw("GET")
 
     def do_POST(self):
         if self.path.startswith("/v1/messages"):
             self._handle_messages()
         else:
-            self._proxy_request("POST")
+            self._proxy_raw("POST")
 
     def do_PUT(self):
-        self._proxy_request("PUT")
+        self._proxy_raw("PUT")
 
     def do_DELETE(self):
-        self._proxy_request("DELETE")
+        self._proxy_raw("DELETE")
 
     def do_PATCH(self):
-        self._proxy_request("PATCH")
+        self._proxy_raw("PATCH")
 
     def do_OPTIONS(self):
-        self._proxy_request("OPTIONS")
+        self._proxy_raw("OPTIONS")
 
     def _handle_health(self):
         active = sum(
@@ -231,9 +255,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(raw_body)
         except json.JSONDecodeError:
+            error_body = b'{"error":"Invalid JSON"}'
             self.send_response(400)
+            self.send_header("content-length", str(len(error_body)))
             self.end_headers()
-            self.wfile.write(b'{"error":"Invalid JSON"}')
+            self.wfile.write(error_body)
             return
 
         messages = payload.get("messages", [])
@@ -289,72 +315,76 @@ class ProxyHandler(BaseHTTPRequestHandler):
             t.start()
             session_state["thread"] = t
 
-        # Forward request
+        # Forward request using http.client for true streaming
         body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body)
-        target_url = f"{UPSTREAM_URL}{self.path}"
 
         tracker.cleanup_stale()
 
         try:
-            req = Request(target_url, data=body, headers=headers, method="POST")
-            with urlopen(req, context=ssl_ctx, timeout=600) as resp:
-                self.send_response(resp.status)
-                for key, value in resp.getheaders():
-                    if key.lower() not in ("transfer-encoding", "content-encoding", "connection"):
-                        self.send_header(key, value)
-                self.end_headers()
+            conn = _upstream_conn()
+            conn.request("POST", self.path, body=body, headers=headers)
+            resp = conn.getresponse()
 
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                if key.lower() not in ("transfer-encoding", "connection"):
+                    self.send_header(key, value)
+            self.end_headers()
+
+            # Stream response and capture SSE token data
+            buffer = b""
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
                 if is_streaming:
-                    # Stream chunks and buffer for token extraction
-                    buffer = b""
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
+                    buffer += chunk
+
+            # Extract input tokens from SSE stream
+            if is_streaming and buffer:
+                try:
+                    text = buffer.decode("utf-8", errors="replace")
+                    for line in text.split("\n"):
+                        if line.startswith("data: ") and '"message_start"' in line:
+                            data = json.loads(line[6:])
+                            usage = data.get("message", {}).get("usage", {})
+                            total_input = (
+                                usage.get("input_tokens", 0)
+                                + usage.get("cache_creation_input_tokens", 0)
+                                + usage.get("cache_read_input_tokens", 0)
+                            )
+                            if total_input > 0:
+                                session_state["last_input_tokens"] = total_input
                             break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                        buffer += chunk
+                except Exception:
+                    pass
+            elif not is_streaming and buffer:
+                try:
+                    data = json.loads(buffer)
+                    usage = data.get("usage", {})
+                    total_input = (
+                        usage.get("input_tokens", 0)
+                        + usage.get("cache_creation_input_tokens", 0)
+                        + usage.get("cache_read_input_tokens", 0)
+                    )
+                    if total_input > 0:
+                        session_state["last_input_tokens"] = total_input
+                except Exception:
+                    pass
 
-                    # Extract tokens from SSE
-                    try:
-                        text = buffer.decode("utf-8", errors="replace")
-                        for line in text.split("\n"):
-                            if line.startswith("data: ") and '"message_start"' in line:
-                                data = json.loads(line[6:])
-                                usage = data.get("message", {}).get("usage", {})
-                                total_input = (
-                                    usage.get("input_tokens", 0)
-                                    + usage.get("cache_creation_input_tokens", 0)
-                                    + usage.get("cache_read_input_tokens", 0)
-                                )
-                                if total_input > 0:
-                                    session_state["last_input_tokens"] = total_input
-                                break
-                    except Exception:
-                        pass
-                else:
-                    resp_body = resp.read()
-                    self.wfile.write(resp_body)
-                    try:
-                        data = json.loads(resp_body)
-                        usage = data.get("usage", {})
-                        total_input = (
-                            usage.get("input_tokens", 0)
-                            + usage.get("cache_creation_input_tokens", 0)
-                            + usage.get("cache_read_input_tokens", 0)
-                        )
-                        if total_input > 0:
-                            session_state["last_input_tokens"] = total_input
-                    except Exception:
-                        pass
+            conn.close()
 
-        except URLError as e:
+        except Exception as e:
             log.error(f"Upstream error: {e}")
+            error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(error_body)))
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(error_body)
 
 
 class ThreadedHTTPServer(HTTPServer):
