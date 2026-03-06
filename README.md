@@ -107,6 +107,8 @@ The summary preserves a chronological timeline of everything that happened — f
 
 ## Uninstall
 
+Run the uninstall script — it handles both manual and marketplace installs, stops the proxy, cleans env vars, and removes all plugin registrations.
+
 **Linux / macOS:**
 ```bash
 cd ~/claude-rolling-context && bash uninstall.sh
@@ -115,6 +117,12 @@ cd ~/claude-rolling-context && bash uninstall.sh
 **Windows (PowerShell):**
 ```powershell
 cd $HOME\claude-rolling-context; powershell -ExecutionPolicy Bypass -File uninstall.ps1
+```
+
+If you installed via marketplace and already deleted the repo, you can run it from the cache:
+```powershell
+cd $HOME\.claude\plugins\cache\rolling-context-marketplace\rolling-context\1.0.0
+powershell -ExecutionPolicy Bypass -File uninstall.ps1
 ```
 
 ## Health Check
