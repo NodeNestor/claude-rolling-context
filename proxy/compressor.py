@@ -33,13 +33,20 @@ RULES:
 - Preserve ALL technical decisions and WHY they were made
 - Preserve ALL code changes: what file, what was changed, what the new code does
 - Preserve ALL errors encountered and how they were resolved
-- Preserve the current project state and what's left to do
-- Preserve user preferences and requirements
+- Preserve ALL user requests and instructions — what they asked for, what constraints they gave, what they said to do or NOT do
+- Preserve user preferences, workflow choices, and recurring patterns (e.g. "always use X", "never do Y")
 - Include key code snippets when they're central to understanding (keep them short)
 - Do NOT editorialize or add commentary
 - Be as DENSE as possible — every sentence should carry information
 
 FORMAT:
+## Active Goal
+- [What the user is CURRENTLY asking for — their most recent request or focus]
+- [Any constraints or rules the user has stated (do/don't do)]
+
+## Previous Goals (completed or shifted away from)
+- [Earlier goals that were finished or that the user moved on from — keep brief]
+
 ## Timeline
 1. [First thing that happened]
 2. [Second thing...]
