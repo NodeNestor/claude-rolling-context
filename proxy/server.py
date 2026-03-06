@@ -105,11 +105,12 @@ def _forward_headers(req_headers: dict, body: bytes = None) -> dict:
     headers = {}
     for key, value in req_headers.items():
         lower = key.lower()
-        if lower in ("host", "transfer-encoding", "connection"):
+        if lower in ("host", "transfer-encoding", "connection", "content-length"):
             continue
         headers[key] = value
     if body is not None:
         headers["content-length"] = str(len(body))
+    log.debug(f"[HDR] Forwarding headers: {list(headers.keys())}")
     return headers
 
 
