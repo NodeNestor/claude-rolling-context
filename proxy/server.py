@@ -66,7 +66,13 @@ class SessionTracker:
         self._sessions = {}
         self._lock = threading.Lock()
 
-    def _fingerprint(self, messages: list) -> str:
+    def _fingerprint(self, messages: list, system=None) -> str:
+        # Use system prompt as stable session identifier
+        if system:
+            if isinstance(system, list):
+                system = json.dumps(system)
+            return hashlib.sha256(system.encode("utf-8", errors="replace")).hexdigest()[:16]
+        # Fallback: first user message
         for msg in messages:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
@@ -75,8 +81,8 @@ class SessionTracker:
                 return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
         return "unknown"
 
-    def get(self, messages: list) -> dict:
-        fp = self._fingerprint(messages)
+    def get(self, messages: list, system=None) -> dict:
+        fp = self._fingerprint(messages, system)
         with self._lock:
             if fp not in self._sessions:
                 self._sessions[fp] = {
@@ -292,9 +298,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         messages = payload.get("messages", [])
+        system = payload.get("system", None)
         is_streaming = payload.get("stream", False)
         model = payload.get("model", "unknown")
-        session_state = tracker.get(messages)
+        session_state = tracker.get(messages, system)
 
         estimated = compressor.estimate_tokens(messages)
         token_count = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else estimated
