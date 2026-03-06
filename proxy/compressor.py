@@ -103,10 +103,6 @@ class RollingCompressor:
                                         total_chars += len(sub.get("text", ""))
         return total_chars
 
-    def estimate_tokens(self, messages: list) -> int:
-        """Rough token estimate for logging. Not used for compression decisions."""
-        return self._count_chars(messages) // 4
-
     def _find_keep_index(self, messages: list, keep_ratio: float) -> int:
         """Find the cut point: keep the last keep_ratio fraction of content."""
         if len(messages) <= 4:
@@ -222,10 +218,10 @@ class RollingCompressor:
 
         conversation_text = self._messages_to_text(to_compress)
 
-        input_tokens = self.estimate_tokens(to_compress)
+        input_chars = self._count_chars(to_compress)
         if existing_summary:
-            input_tokens += len(existing_summary) // 4
-        summary_max_tokens = max(2000, min(16000, int(input_tokens * SUMMARY_RATIO)))
+            input_chars += len(existing_summary)
+        summary_max_tokens = max(2000, min(16000, int((input_chars // 4) * SUMMARY_RATIO)))
 
         existing_section = ""
         if existing_summary:
@@ -242,7 +238,7 @@ class RollingCompressor:
         )
 
         log.info(
-            f"Summarizing {len(to_compress)} messages (~{input_tokens:,} tokens) "
+            f"Summarizing {len(to_compress)} messages ({input_chars:,} chars) "
             f"with {self.summarizer_model} (max_tokens={summary_max_tokens:,})..."
         )
 
@@ -269,8 +265,7 @@ class RollingCompressor:
             data = json.loads(resp.read())
 
         new_summary = data["content"][0]["text"]
-        summary_tokens = len(new_summary) // 4
-        log.info(f"Summary generated: ~{summary_tokens:,} tokens ({len(new_summary)} chars)")
+        log.info(f"Summary generated: {len(new_summary):,} chars")
 
         summary_message = {
             "role": "user",
@@ -294,16 +289,27 @@ class RollingCompressor:
 
         compressed = [summary_message, ack_message] + recent_messages
 
-        original_tokens = self.estimate_tokens(messages)
-        compressed_tokens = self.estimate_tokens(compressed)
+        original_chars = self._count_chars(messages)
+        compressed_chars = self._count_chars(compressed)
+        summary_chars = len(new_summary)
+        recent_chars = self._count_chars(recent_messages)
         self.compression_count += 1
-        self.total_tokens_saved += original_tokens - compressed_tokens
-
-        log.info(
-            f"Compression #{self.compression_count}: "
-            f"{original_tokens:,} -> {compressed_tokens:,} tokens "
-            f"(saved {original_tokens - compressed_tokens:,}, "
-            f"summary={summary_tokens:,}, recent={self.estimate_tokens(recent_messages):,})"
-        )
+        if real_token_count:
+            reduction = compressed_chars / original_chars if original_chars > 0 else 0
+            estimated_output_tokens = int(real_token_count * reduction)
+            self.total_tokens_saved += real_token_count - estimated_output_tokens
+            log.info(
+                f"Compression #{self.compression_count}: "
+                f"~{real_token_count:,} -> ~{estimated_output_tokens:,} real tokens "
+                f"({reduction:.0%} of original, "
+                f"summary={summary_chars:,} chars, recent={recent_chars:,} chars)"
+            )
+        else:
+            self.total_tokens_saved += (original_chars - compressed_chars) // 4
+            log.info(
+                f"Compression #{self.compression_count}: "
+                f"{original_chars:,} -> {compressed_chars:,} chars "
+                f"(summary={summary_chars:,}, recent={recent_chars:,})"
+            )
 
         return compressed

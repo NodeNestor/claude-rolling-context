@@ -257,7 +257,7 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         entry["pending_hashes"] = key_hashes
         log.info(
             f"[BG] Compression ready: "
-            f"~{compressor.estimate_tokens(prefix):,} tokens "
+            f"{compressor._count_chars(prefix):,} chars "
             f"({len(prefix)} prefix messages, key={len(key_hashes)} hashes, "
             f"summarized {len(summarized) - start} messages)"
         )
@@ -431,12 +431,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # Hash all messages for content-based matching
         msg_hashes = _hash_messages(messages)
-        estimated = compressor.estimate_tokens(messages)
-        token_count = estimated
+        msg_chars = compressor._count_chars(messages)
 
         log.info(
             f"[MSG] model={model} stream={is_streaming} "
-            f"messages={len(messages)} est_tokens=~{estimated:,}"
+            f"messages={len(messages)} chars={msg_chars:,}"
         )
 
         # Promote any pending compressions
@@ -470,21 +469,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if isinstance(block, dict):
                             block.pop("cache_control", None)
 
-            merged_tokens = compressor.estimate_tokens(merged)
-            if merged_tokens < token_count:
+            merged_chars = compressor._count_chars(merged)
+            if merged_chars < msg_chars:
                 log.info(
-                    f"[MSG] Injecting: ~{token_count:,} -> ~{merged_tokens:,} tokens "
+                    f"[MSG] Injecting: {msg_chars:,} -> {merged_chars:,} chars "
                     f"({len(messages)} -> {len(merged)} messages, "
                     f"replaced 0-{match_end} with {len(match['prefix'])} prefix "
                     f"+ {len(new_messages)} new)"
                 )
                 payload["messages"] = merged
-                token_count = merged_tokens
+                msg_chars = merged_chars
                 injected = True
             else:
                 log.info(
                     f"[MSG] Compression no longer helps: "
-                    f"merged={merged_tokens:,} >= current={token_count:,}, removing"
+                    f"merged={merged_chars:,} >= current={msg_chars:,} chars, removing"
                 )
                 store.remove(match)
                 match = None
