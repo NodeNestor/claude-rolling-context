@@ -5,6 +5,10 @@ A transparent proxy between Claude Code and the Anthropic API.
 Compresses old messages in the background using Haiku, keeping recent messages
 verbatim. Zero latency — compression runs async, applied on the next request.
 
+Uses content-based matching: hashes each message, recognizes previously compressed
+messages by their content, and replaces them with the compressed version.
+No sessions, no fingerprints — just content recognition.
+
 Pure stdlib — no external dependencies needed.
 """
 
@@ -69,76 +73,91 @@ def _upstream_conn():
         )
 
 
-class SessionTracker:
+# ---------------------------------------------------------------------------
+# Content-based matching
+# ---------------------------------------------------------------------------
+
+def _normalize_content(content):
+    """Strip volatile metadata (cache_control) for stable hashing."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        result = []
+        for block in content:
+            if isinstance(block, dict):
+                b = {}
+                for k, v in block.items():
+                    if k == "cache_control":
+                        continue
+                    if k == "content" and isinstance(v, (list, str)):
+                        b[k] = _normalize_content(v)
+                    else:
+                        b[k] = v
+                result.append(b)
+            else:
+                result.append(block)
+        return result
+    return content
+
+
+def _hash_message(msg: dict) -> str:
+    """Stable hash of a message, ignoring cache_control metadata."""
+    role = msg.get("role", "")
+    content = _normalize_content(msg.get("content", ""))
+    if not isinstance(content, str):
+        content = json.dumps(content, sort_keys=True)
+    raw = f"{role}:{content}"
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _hash_messages(messages: list) -> list:
+    return [_hash_message(m) for m in messages]
+
+
+class CompressionStore:
+    """Content-based compression tracking. No sessions, no fingerprints.
+
+    Recognizes messages by their content hashes. When we compress messages,
+    we store hashes of the originals. On future requests, if we see those
+    same messages, we replace them with the compressed version.
+
+    Keyed by hash of first message — naturally separates conversations.
+    """
+
     def __init__(self):
-        self._sessions = {}
         self._lock = threading.Lock()
+        self._entries = {}  # first_msg_hash -> entry
 
-    def _extract_text(self, content) -> str:
-        if isinstance(content, str):
-            return content[:300]
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    return block.get("text", "")[:300]
-        return ""
+    def get_or_create(self, messages: list) -> dict:
+        if not messages:
+            return self._new_entry()
+        key = _hash_message(messages[0])
+        with self._lock:
+            if key not in self._entries:
+                self._entries[key] = self._new_entry()
+            return self._entries[key]
 
-    def _fingerprint(self, messages: list) -> str:
-        for msg in messages:
-            if msg.get("role") == "user":
-                text = self._extract_text(msg.get("content", ""))
-                if text:
-                    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-        return "unknown"
-
-    def _new_session(self):
+    def _new_entry(self):
         return {
-            "pending": None,
-            "pending_msg_count": 0,
-            "compressed_prefix": None,
-            "compressed_msg_count": 0,
-            "thread": None,
-            "last_input_tokens": 0,
+            "original_hashes": [],   # hashes of original messages we replaced
+            "prefix": None,          # compressed replacement messages
+            "pending": None,         # pending compression result
+            "pending_hashes": None,  # hashes for pending
+            "thread": None,          # background compression thread
+            "last_input_tokens": 0,  # API-reported token count
         }
 
-    def get(self, messages: list) -> dict:
-        fp = self._fingerprint(messages)
-        with self._lock:
-            if fp in self._sessions:
-                log.debug(f"[SESSION] matched fp={fp} sessions={len(self._sessions)}")
-                return self._sessions[fp]
-
-            # Unknown fingerprint — only migrate if this looks like a real conversation
-            # (not a tiny tool call with 1-3 messages)
-            if len(messages) > 10:
-                for old_fp, state in list(self._sessions.items()):
-                    if state["compressed_prefix"] is not None or state["pending"] is not None:
-                        log.info(
-                            f"[SESSION] Migrating session {old_fp} -> {fp} "
-                            f"(fingerprint changed, {len(messages)} messages)"
-                        )
-                        self._sessions[fp] = state
-                        del self._sessions[old_fp]
-                        return state
-
-            log.debug(f"[SESSION] new session fp={fp} msgs={len(messages)} sessions={len(self._sessions)}")
-            self._sessions[fp] = self._new_session()
-            return self._sessions[fp]
-
-    def cleanup_stale(self, max_sessions: int = 50):
-        with self._lock:
-            if len(self._sessions) > max_sessions:
-                to_remove = [
-                    fp for fp, s in self._sessions.items()
-                    if s["pending"] is None
-                    and (s["thread"] is None or not s["thread"].is_alive())
-                ]
-                for fp in to_remove[:len(self._sessions) - max_sessions]:
-                    del self._sessions[fp]
+    @property
+    def entries(self):
+        return self._entries
 
 
-tracker = SessionTracker()
+store = CompressionStore()
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool = False) -> dict:
     headers = {}
@@ -182,20 +201,23 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-def _do_background_compression(session_state: dict, messages: list, original_msg_count: int, auth_headers: dict):
-    log.info(f"[BG] Starting background compression of {len(messages)} messages (original={original_msg_count})...")
+def _do_background_compression(entry: dict, messages: list, original_hashes: list, auth_headers: dict):
+    log.info(
+        f"[BG] Starting compression of {len(messages)} messages "
+        f"(covers {len(original_hashes)} originals)..."
+    )
     try:
         compressed = compressor.compress(messages, auth_headers)
-        session_state["pending"] = compressed
-        session_state["pending_msg_count"] = original_msg_count
+        entry["pending"] = compressed
+        entry["pending_hashes"] = original_hashes
         log.info(
             f"[BG] Compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
-            f"({len(compressed)} messages, based on {original_msg_count} original)"
+            f"({len(compressed)} messages, covers {len(original_hashes)} originals)"
         )
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
-        session_state["pending"] = None
+        entry["pending"] = None
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -293,8 +315,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_health(self):
         active = sum(
-            1 for s in tracker._sessions.values()
-            if s["thread"] is not None and s["thread"].is_alive()
+            1 for e in store.entries.values()
+            if e["thread"] is not None and e["thread"].is_alive()
         )
         data = {
             "status": "ok",
@@ -304,7 +326,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "upstream_url": UPSTREAM_URL,
             "compression_count": compressor.compression_count,
             "total_tokens_saved": compressor.total_tokens_saved,
-            "active_sessions": len(tracker._sessions),
+            "active_conversations": len(store.entries),
             "active_compressions": active,
         }
         body = json.dumps(data).encode()
@@ -336,74 +358,80 @@ class ProxyHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages", [])
         is_streaming = payload.get("stream", False)
         model = payload.get("model", "unknown")
-        session_state = tracker.get(messages)
+
+        # Hash all messages for content-based matching
+        msg_hashes = _hash_messages(messages)
+        entry = store.get_or_create(messages)
 
         estimated = compressor.estimate_tokens(messages)
-        token_count = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else estimated
+        token_count = entry["last_input_tokens"] if entry["last_input_tokens"] > 0 else estimated
 
         log.info(
             f"[MSG] model={model} stream={is_streaming} "
             f"messages={len(messages)} est_tokens=~{estimated:,} "
-            f"last_input_tokens={session_state['last_input_tokens']:,}"
+            f"last_input_tokens={entry['last_input_tokens']:,}"
         )
 
-        # Promote pending compression to active prefix
-        if session_state["pending"] is not None:
-            session_state["compressed_prefix"] = session_state["pending"]
-            session_state["compressed_msg_count"] = session_state["pending_msg_count"]
-            session_state["pending"] = None
-            session_state["pending_msg_count"] = 0
+        # Promote pending compression
+        if entry["pending"] is not None:
+            entry["prefix"] = entry["pending"]
+            entry["original_hashes"] = entry["pending_hashes"]
+            entry["pending"] = None
+            entry["pending_hashes"] = None
             log.info(
-                f"[MSG] New compression ready: {len(session_state['compressed_prefix'])} prefix messages "
-                f"replacing first {session_state['compressed_msg_count']} original messages"
+                f"[MSG] New compression ready: {len(entry['prefix'])} prefix messages "
+                f"replacing {len(entry['original_hashes'])} original messages"
             )
 
-        # Safety: if message count dropped (Claude Code /compact or new session), reset
-        if session_state["compressed_prefix"] is not None and len(messages) < session_state["compressed_msg_count"]:
-            log.info(
-                f"[MSG] Message count dropped ({len(messages)} < {session_state['compressed_msg_count']}), "
-                f"resetting compression state"
-            )
-            session_state["compressed_prefix"] = None
-            session_state["compressed_msg_count"] = 0
+        # Content-based injection: if we recognize the messages, replace them
+        if entry["prefix"] is not None and entry["original_hashes"]:
+            oh = entry["original_hashes"]
 
-        # Re-inject compressed prefix every request
-        if session_state["compressed_prefix"] is not None:
-            prefix = session_state["compressed_prefix"]
-            replace_count = session_state["compressed_msg_count"]
+            if len(oh) <= len(msg_hashes) and oh == msg_hashes[:len(oh)]:
+                # Full match — replace compressed messages with prefix
+                new_messages = messages[len(oh):]
+                merged = entry["prefix"] + new_messages
+                merged = _validate_tool_pairs(merged)
 
-            # Append any new messages beyond what was compressed
-            new_messages = messages[replace_count:] if replace_count < len(messages) else []
-            merged = prefix + new_messages
-            merged = _validate_tool_pairs(merged)
-            merged_tokens = compressor.estimate_tokens(merged)
-
-            if merged_tokens < token_count:
+                # Strip cache_control from injected messages
                 for msg in merged:
                     content = msg.get("content", "")
                     if isinstance(content, list):
                         for block in content:
                             if isinstance(block, dict):
                                 block.pop("cache_control", None)
-                log.info(
-                    f"[MSG] Injecting compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
-                    f"({len(messages)} -> {len(merged)} messages, "
-                    f"{len(new_messages)} new messages after prefix)"
-                )
-                payload["messages"] = merged
-                token_count = merged_tokens
-            else:
-                log.info(
-                    f"[MSG] Compression no longer helps: merged={merged_tokens:,} >= current={token_count:,}, clearing"
-                )
-                session_state["compressed_prefix"] = None
-                session_state["compressed_msg_count"] = 0
 
-        # Trigger background compression — use API-reported tokens if available
+                merged_tokens = compressor.estimate_tokens(merged)
+                if merged_tokens < token_count:
+                    log.info(
+                        f"[MSG] Injecting: ~{token_count:,} -> ~{merged_tokens:,} tokens "
+                        f"({len(messages)} -> {len(merged)} messages, "
+                        f"replaced {len(oh)} with {len(entry['prefix'])} prefix "
+                        f"+ {len(new_messages)} new)"
+                    )
+                    payload["messages"] = merged
+                    token_count = merged_tokens
+                else:
+                    log.info(
+                        f"[MSG] Compression no longer helps: "
+                        f"merged={merged_tokens:,} >= current={token_count:,}, clearing"
+                    )
+                    entry["prefix"] = None
+                    entry["original_hashes"] = []
+            else:
+                # Hashes don't match — conversation was compacted or changed
+                log.info(
+                    f"[MSG] Content mismatch: stored {len(oh)} hashes, "
+                    f"request has {len(msg_hashes)} messages. Resetting compression."
+                )
+                entry["prefix"] = None
+                entry["original_hashes"] = []
+
+        # Trigger background compression
         current_messages = payload.get("messages", messages)
         msg_estimate = compressor.estimate_tokens(current_messages)
-        already_compressing = session_state["thread"] is not None and session_state["thread"].is_alive()
-        trigger_tokens = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else token_count
+        already_compressing = entry["thread"] is not None and entry["thread"].is_alive()
+        trigger_tokens = entry["last_input_tokens"] if entry["last_input_tokens"] > 0 else token_count
 
         if trigger_tokens > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
             log.info(
@@ -412,11 +440,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             t = threading.Thread(
                 target=_do_background_compression,
-                args=(session_state, current_messages, len(messages), auth_headers),
+                args=(entry, current_messages, msg_hashes, auth_headers),
                 daemon=True,
             )
             t.start()
-            session_state["thread"] = t
+            entry["thread"] = t
         else:
             log.debug(
                 f"[MSG] No compression needed: trigger_tokens={trigger_tokens:,} "
@@ -424,11 +452,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
 
         # Forward request — strip Accept-Encoding so we get plain text SSE
-        # (needed to parse token counts from response)
         body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body, strip_encoding=True)
-
-        tracker.cleanup_stale()
 
         log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
 
@@ -485,7 +510,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 + usage.get("cache_read_input_tokens", 0)
                             )
                             if total_input > 0:
-                                session_state["last_input_tokens"] = total_input
+                                entry["last_input_tokens"] = total_input
                                 log.info(f"[MSG] Input tokens from SSE: {total_input:,}")
                             break
                 except Exception as e:
@@ -500,7 +525,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         + usage.get("cache_read_input_tokens", 0)
                     )
                     if total_input > 0:
-                        session_state["last_input_tokens"] = total_input
+                        entry["last_input_tokens"] = total_input
                         log.info(f"[MSG] Input tokens from response: {total_input:,}")
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse response for tokens: {e}")
@@ -539,6 +564,7 @@ def main():
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
     log.info(f"  Forwarding to: {UPSTREAM_URL}")
+    log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
     server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
     try:
