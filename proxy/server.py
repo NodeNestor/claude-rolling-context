@@ -74,33 +74,17 @@ class SessionTracker:
         self._sessions = {}
         self._lock = threading.Lock()
 
-    def _extract_text(self, content) -> str:
-        if isinstance(content, str):
-            return content[:300]
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    return block.get("text", "")[:300]
-        return ""
-
-    def _fingerprint(self, messages: list) -> str:
-        # Use first user message text — stable until compression replaces it,
-        # then the summary marker becomes the new stable anchor.
-        for msg in messages:
-            if msg.get("role") == "user":
-                text = self._extract_text(msg.get("content", ""))
-                if text:
-                    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-        return "unknown"
-
-    def get(self, messages: list) -> dict:
-        fp = self._fingerprint(messages)
-        log.debug(f"[SESSION] fingerprint={fp} sessions={len(self._sessions)}")
+    def get(self, auth_header: str) -> dict:
+        # Use auth token as session key — stable for entire session
+        fp = hashlib.sha256(auth_header.encode("utf-8", errors="replace")).hexdigest()[:16]
+        log.debug(f"[SESSION] key={fp} sessions={len(self._sessions)}")
         with self._lock:
             if fp not in self._sessions:
                 self._sessions[fp] = {
                     "pending": None,
                     "pending_msg_count": 0,
+                    "compressed_prefix": None,  # kept and re-injected every request
+                    "compressed_msg_count": 0,   # how many original msgs the prefix replaces
                     "thread": None,
                     "last_input_tokens": 0,
                 }
@@ -163,12 +147,12 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-def _do_background_compression(session_state: dict, messages: list, msg_count: int, auth_headers: dict):
-    log.info(f"[BG] Starting background compression of {msg_count} messages...")
+def _do_background_compression(session_state: dict, messages: list, original_msg_count: int, auth_headers: dict):
+    log.info(f"[BG] Starting background compression of {len(messages)} messages (original={original_msg_count})...")
     try:
         compressed = compressor.compress(messages, auth_headers)
         session_state["pending"] = compressed
-        session_state["pending_msg_count"] = msg_count
+        session_state["pending_msg_count"] = original_msg_count
         log.info(
             f"[BG] Compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
@@ -317,7 +301,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages", [])
         is_streaming = payload.get("stream", False)
         model = payload.get("model", "unknown")
-        session_state = tracker.get(messages)
+        auth = req_headers.get("Authorization", req_headers.get("x-api-key", "unknown"))
+        session_state = tracker.get(auth)
 
         estimated = compressor.estimate_tokens(messages)
         token_count = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else estimated
@@ -328,15 +313,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"last_input_tokens={session_state['last_input_tokens']:,}"
         )
 
-        # Apply pending compression
+        # Promote pending compression to active prefix
         if session_state["pending"] is not None:
-            compressed = session_state["pending"]
-            original_count = session_state["pending_msg_count"]
+            session_state["compressed_prefix"] = session_state["pending"]
+            session_state["compressed_msg_count"] = session_state["pending_msg_count"]
             session_state["pending"] = None
             session_state["pending_msg_count"] = 0
+            log.info(
+                f"[MSG] New compression ready: {len(session_state['compressed_prefix'])} prefix messages "
+                f"replacing first {session_state['compressed_msg_count']} original messages"
+            )
 
-            new_messages = messages[original_count:] if original_count < len(messages) else []
-            merged = compressed + new_messages
+        # Re-inject compressed prefix every request
+        if session_state["compressed_prefix"] is not None:
+            prefix = session_state["compressed_prefix"]
+            replace_count = session_state["compressed_msg_count"]
+
+            # Append any new messages beyond what was compressed
+            new_messages = messages[replace_count:] if replace_count < len(messages) else []
+            merged = prefix + new_messages
             merged = _validate_tool_pairs(merged)
             merged_tokens = compressor.estimate_tokens(merged)
 
@@ -348,17 +343,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             if isinstance(block, dict):
                                 block.pop("cache_control", None)
                 log.info(
-                    f"[MSG] Applying compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
+                    f"[MSG] Injecting compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
                     f"({len(messages)} -> {len(merged)} messages, "
-                    f"{len(new_messages)} new messages appended)"
+                    f"{len(new_messages)} new messages after prefix)"
                 )
                 payload["messages"] = merged
                 token_count = merged_tokens
                 session_state["last_input_tokens"] = 0
             else:
                 log.info(
-                    f"[MSG] Skipping compression: merged={merged_tokens:,} >= current={token_count:,}"
+                    f"[MSG] Compression no longer helps: merged={merged_tokens:,} >= current={token_count:,}, clearing"
                 )
+                session_state["compressed_prefix"] = None
+                session_state["compressed_msg_count"] = 0
 
         # Trigger background compression
         current_messages = payload.get("messages", messages)
@@ -372,7 +369,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             t = threading.Thread(
                 target=_do_background_compression,
-                args=(session_state, current_messages, len(current_messages), auth_headers),
+                args=(session_state, current_messages, len(messages), auth_headers),
                 daemon=True,
             )
             t.start()
