@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 from compressor import RollingCompressor
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
@@ -104,8 +104,10 @@ tracker = SessionTracker()
 def _forward_headers(req_headers: dict, body: bytes = None) -> dict:
     headers = {}
     for key, value in req_headers.items():
-        if key.lower() != "host":
-            headers[key] = value
+        lower = key.lower()
+        if lower in ("host", "transfer-encoding", "connection"):
+            continue
+        headers[key] = value
     if body is not None:
         headers["content-length"] = str(len(body))
     return headers
@@ -139,17 +141,18 @@ def _validate_tool_pairs(messages: list) -> list:
 
 
 def _do_background_compression(session_state: dict, messages: list, msg_count: int, auth_headers: dict):
+    log.info(f"[BG] Starting background compression of {msg_count} messages...")
     try:
         compressed = compressor.compress(messages, auth_headers)
         session_state["pending"] = compressed
         session_state["pending_msg_count"] = msg_count
         log.info(
-            f"Background compression ready: "
+            f"[BG] Compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
             f"({len(compressed)} messages, based on {msg_count} original)"
         )
     except Exception as e:
-        log.error(f"Background compression failed: {e}")
+        log.error(f"[BG] Compression failed: {e}", exc_info=True)
         session_state["pending"] = None
 
 
@@ -172,27 +175,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         headers = _forward_headers(self._get_headers_dict(), body if body else None)
 
+        log.info(f"[RAW] {method} {self.path} -> {UPSTREAM_URL} (body={len(body)} bytes)")
+
         try:
             conn = _upstream_conn()
             conn.request(method, self.path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
 
+            log.info(f"[RAW] Response: {resp.status} {resp.reason}")
+
             self.send_response(resp.status)
-            for key, value in resp.getheaders():
-                if key.lower() not in ("transfer-encoding", "connection"):
-                    self.send_header(key, value)
+            resp_headers = resp.getheaders()
+            log.debug(f"[RAW] Response headers: {resp_headers}")
+            for key, value in resp_headers:
+                lower = key.lower()
+                if lower in ("connection", "transfer-encoding"):
+                    continue
+                self.send_header(key, value)
             self.end_headers()
 
+            total_bytes = 0
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                total_bytes += len(chunk)
 
+            log.info(f"[RAW] Done streaming {total_bytes:,} bytes")
             conn.close()
         except Exception as e:
-            log.error(f"Upstream error: {e}")
+            log.error(f"[RAW] Upstream error: {e}", exc_info=True)
             error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
@@ -201,27 +215,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(error_body)
 
     def do_GET(self):
+        log.info(f"[REQ] GET {self.path}")
         if self.path == "/health":
             self._handle_health()
         else:
             self._proxy_raw("GET")
 
     def do_POST(self):
+        log.info(f"[REQ] POST {self.path}")
         if self.path.startswith("/v1/messages"):
             self._handle_messages()
         else:
             self._proxy_raw("POST")
 
     def do_PUT(self):
+        log.info(f"[REQ] PUT {self.path}")
         self._proxy_raw("PUT")
 
     def do_DELETE(self):
+        log.info(f"[REQ] DELETE {self.path}")
         self._proxy_raw("DELETE")
 
     def do_PATCH(self):
+        log.info(f"[REQ] PATCH {self.path}")
         self._proxy_raw("PATCH")
 
     def do_OPTIONS(self):
+        log.info(f"[REQ] OPTIONS {self.path}")
         self._proxy_raw("OPTIONS")
 
     def _handle_health(self):
@@ -252,9 +272,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         req_headers = self._get_headers_dict()
         auth_headers = get_passthrough_headers(req_headers)
 
+        log.info(f"[MSG] POST {self.path} (body={len(raw_body)} bytes)")
+
         try:
             payload = json.loads(raw_body)
         except json.JSONDecodeError:
+            log.error("[MSG] Invalid JSON in request body")
             error_body = b'{"error":"Invalid JSON"}'
             self.send_response(400)
             self.send_header("content-length", str(len(error_body)))
@@ -264,10 +287,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         messages = payload.get("messages", [])
         is_streaming = payload.get("stream", False)
+        model = payload.get("model", "unknown")
         session_state = tracker.get(messages)
 
         estimated = compressor.estimate_tokens(messages)
         token_count = session_state["last_input_tokens"] if session_state["last_input_tokens"] > 0 else estimated
+
+        log.info(
+            f"[MSG] model={model} stream={is_streaming} "
+            f"messages={len(messages)} est_tokens=~{estimated:,} "
+            f"last_input_tokens={session_state['last_input_tokens']:,}"
+        )
 
         # Apply pending compression
         if session_state["pending"] is not None:
@@ -289,13 +319,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             if isinstance(block, dict):
                                 block.pop("cache_control", None)
                 log.info(
-                    f"Applying compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
+                    f"[MSG] Applying compression: ~{token_count:,} -> ~{merged_tokens:,} tokens "
                     f"({len(messages)} -> {len(merged)} messages, "
                     f"{len(new_messages)} new messages appended)"
                 )
                 payload["messages"] = merged
                 token_count = merged_tokens
                 session_state["last_input_tokens"] = 0
+            else:
+                log.info(
+                    f"[MSG] Skipping compression: merged={merged_tokens:,} >= current={token_count:,}"
+                )
 
         # Trigger background compression
         current_messages = payload.get("messages", messages)
@@ -304,7 +338,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if token_count > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
             log.info(
-                f"Context at ~{token_count:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
+                f"[MSG] Context at ~{token_count:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
                 f"Compressing in background..."
             )
             t = threading.Thread(
@@ -314,6 +348,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             t.start()
             session_state["thread"] = t
+        else:
+            log.debug(
+                f"[MSG] No compression needed: tokens={token_count:,} "
+                f"trigger={TRIGGER_TOKENS:,} est={msg_estimate:,} compressing={already_compressing}"
+            )
 
         # Forward request using http.client for true streaming
         body = json.dumps(payload).encode()
@@ -321,27 +360,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         tracker.cleanup_stale()
 
+        log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
+
         try:
             conn = _upstream_conn()
             conn.request("POST", self.path, body=body, headers=headers)
             resp = conn.getresponse()
 
+            log.info(f"[MSG] Upstream response: {resp.status} {resp.reason}")
+
             self.send_response(resp.status)
-            for key, value in resp.getheaders():
-                if key.lower() not in ("transfer-encoding", "connection"):
-                    self.send_header(key, value)
+            resp_headers = resp.getheaders()
+            log.debug(f"[MSG] Response headers: {resp_headers}")
+            for key, value in resp_headers:
+                lower = key.lower()
+                if lower in ("connection", "transfer-encoding"):
+                    continue
+                self.send_header(key, value)
             self.end_headers()
+
+            log.info(f"[MSG] Streaming response...")
 
             # Stream response and capture SSE token data
             buffer = b""
+            total_bytes = 0
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                total_bytes += len(chunk)
                 if is_streaming:
                     buffer += chunk
+
+            log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 
             # Extract input tokens from SSE stream
             if is_streaming and buffer:
@@ -358,9 +411,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             )
                             if total_input > 0:
                                 session_state["last_input_tokens"] = total_input
+                                log.info(f"[MSG] Input tokens from SSE: {total_input:,}")
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"[MSG] Failed to parse SSE for tokens: {e}")
             elif not is_streaming and buffer:
                 try:
                     data = json.loads(buffer)
@@ -372,13 +426,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     if total_input > 0:
                         session_state["last_input_tokens"] = total_input
-                except Exception:
-                    pass
+                        log.info(f"[MSG] Input tokens from response: {total_input:,}")
+                except Exception as e:
+                    log.warning(f"[MSG] Failed to parse response for tokens: {e}")
 
             conn.close()
 
         except Exception as e:
-            log.error(f"Upstream error: {e}")
+            log.error(f"[MSG] Upstream error: {e}", exc_info=True)
             error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
