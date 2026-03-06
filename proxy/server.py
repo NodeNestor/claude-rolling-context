@@ -127,31 +127,30 @@ class CompressionStore:
         self._compressions = []  # list of compression entries
 
     def find_match(self, msg_hashes: list):
-        """Find a compression whose original_hashes is a prefix of msg_hashes."""
+        """Find a compression whose hash chain appears in msg_hashes.
+
+        Returns the match whose chain ends furthest into the request
+        (latest compression = covers the most history).
+        Replaces everything up to and including the match, since the
+        compression already contains a summary of everything before it.
+        """
         with self._lock:
             best = None
-            best_len = 0
+            best_end = -1  # position in msg_hashes where the match ends
             for entry in self._compressions:
                 oh = entry["original_hashes"]
                 if not oh:
                     continue
-                n = len(oh)
-                if n <= len(msg_hashes) and n > best_len:
-                    if oh == msg_hashes[:n]:
-                        best = entry
-                        best_len = n
-                    else:
-                        # Find where hashes diverge for debugging
-                        mismatch_at = -1
-                        for i in range(min(n, len(msg_hashes))):
-                            if oh[i] != msg_hashes[i]:
-                                mismatch_at = i
-                                break
-                        log.warning(
-                            f"[MATCH] Hash mismatch at index {mismatch_at} "
-                            f"(stored {n} hashes, request has {len(msg_hashes)} messages)"
-                        )
-            return best, best_len
+                # Search for the hash chain in msg_hashes
+                chain_len = len(oh)
+                for start in range(len(msg_hashes) - chain_len + 1):
+                    if msg_hashes[start:start + chain_len] == oh:
+                        end = start + chain_len
+                        if end > best_end:
+                            best = entry
+                            best_end = end
+                        break  # first occurrence of this chain is enough
+            return best, best_end
 
     def add(self) -> dict:
         entry = {
@@ -223,19 +222,18 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-def _do_background_compression(entry: dict, messages: list, original_hashes: list, auth_headers: dict):
-    log.info(
-        f"[BG] Starting compression of {len(messages)} messages "
-        f"(covers {len(original_hashes)} originals)..."
-    )
+def _do_background_compression(entry: dict, messages: list, auth_headers: dict):
+    """Compress messages and store hashes of the input as the match key."""
+    input_hashes = _hash_messages(messages)
+    log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
         compressed = compressor.compress(messages, auth_headers)
         entry["pending"] = compressed
-        entry["pending_hashes"] = original_hashes
+        entry["pending_hashes"] = input_hashes
         log.info(
             f"[BG] Compression ready: "
             f"~{compressor.estimate_tokens(compressed):,} tokens "
-            f"({len(compressed)} messages, replaces {len(original_hashes)} originals)"
+            f"({len(compressed)} messages, key={len(input_hashes)} hashes)"
         )
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
@@ -404,12 +402,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
 
         # Scan: do any stored compressions match this request's messages?
-        match, match_len = store.find_match(msg_hashes)
+        match, match_end = store.find_match(msg_hashes)
         injected = False
 
-        if match and match["prefix"] is not None:
-            # Replace matched messages with compressed prefix
-            new_messages = messages[match_len:]
+        if match and match["prefix"] is not None and match_end > 0:
+            # Replace everything up to match_end with the prefix
+            # (prefix contains summary of everything before it)
+            new_messages = messages[match_end:]
             merged = match["prefix"] + new_messages
             merged = _validate_tool_pairs(merged)
 
@@ -426,7 +425,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.info(
                     f"[MSG] Injecting: ~{token_count:,} -> ~{merged_tokens:,} tokens "
                     f"({len(messages)} -> {len(merged)} messages, "
-                    f"replaced {match_len} with {len(match['prefix'])} prefix "
+                    f"replaced 0-{match_end} with {len(match['prefix'])} prefix "
                     f"+ {len(new_messages)} new)"
                 )
                 payload["messages"] = merged
@@ -541,7 +540,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         entry = store.add()
                     t = threading.Thread(
                         target=_do_background_compression,
-                        args=(entry, current_messages, msg_hashes, auth_headers),
+                        args=(entry, current_messages, auth_headers),
                         daemon=True,
                     )
                     t.start()
