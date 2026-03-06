@@ -148,7 +148,6 @@ class CompressionStore:
             "pending": None,         # pending compression result
             "pending_hashes": None,  # hashes for pending
             "thread": None,          # background compression thread
-            "last_input_tokens": 0,  # API-reported token count
         }
         with self._lock:
             self._compressions.append(entry)
@@ -427,39 +426,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 store.remove(match)
                 match = None
 
-        # Trigger background compression if needed
+        # Save current state for post-response compression trigger
         current_messages = payload.get("messages", messages)
-        msg_estimate = compressor.estimate_tokens(current_messages)
-
-        # Check if any compression is already running
-        already_compressing = any(
-            e["thread"] is not None and e["thread"].is_alive()
-            for e in store.compressions
-        )
-
-        if estimated > TRIGGER_TOKENS and msg_estimate > TARGET_TOKENS and not already_compressing:
-            log.info(
-                f"[MSG] Context at ~{estimated:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
-                f"Compressing in background..."
-            )
-            # Create or reuse entry for this compression
-            if match:
-                entry = match
-            else:
-                entry = store.add()
-            t = threading.Thread(
-                target=_do_background_compression,
-                args=(entry, current_messages, msg_hashes, auth_headers),
-                daemon=True,
-            )
-            t.start()
-            entry["thread"] = t
-        else:
-            log.debug(
-                f"[MSG] No compression needed: est={estimated:,} "
-                f"trigger={TRIGGER_TOKENS:,} msg_est={msg_estimate:,} "
-                f"compressing={already_compressing}"
-            )
 
         # Forward request — strip Accept-Encoding so we get plain text SSE
         body = json.dumps(payload).encode()
@@ -494,6 +462,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Stream response and capture SSE token data
             buffer = b""
             total_bytes = 0
+            total_input = 0
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
@@ -520,8 +489,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 + usage.get("cache_read_input_tokens", 0)
                             )
                             if total_input > 0:
-                                if match:
-                                    match["last_input_tokens"] = total_input
                                 log.info(f"[MSG] Input tokens from SSE: {total_input:,}")
                             break
                 except Exception as e:
@@ -536,13 +503,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         + usage.get("cache_read_input_tokens", 0)
                     )
                     if total_input > 0:
-                        if match:
-                            match["last_input_tokens"] = total_input
                         log.info(f"[MSG] Input tokens from response: {total_input:,}")
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse response for tokens: {e}")
 
             conn.close()
+
+            # Trigger compression based on REAL token count from API response
+            if total_input > 0 and total_input > TRIGGER_TOKENS:
+                msg_estimate = compressor.estimate_tokens(current_messages)
+                already_compressing = any(
+                    e["thread"] is not None and e["thread"].is_alive()
+                    for e in store.compressions
+                )
+                if msg_estimate > TARGET_TOKENS and not already_compressing:
+                    log.info(
+                        f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
+                        f"Compressing in background..."
+                    )
+                    if match:
+                        entry = match
+                    else:
+                        entry = store.add()
+                    t = threading.Thread(
+                        target=_do_background_compression,
+                        args=(entry, current_messages, msg_hashes, auth_headers),
+                        daemon=True,
+                    )
+                    t.start()
+                    entry["thread"] = t
 
         except Exception as e:
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)

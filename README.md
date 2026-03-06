@@ -9,10 +9,10 @@ A transparent proxy that gives Claude Code **rolling context compression** — o
 ```
 Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Anthropic API
                          │
-                         ├─ if tokens > trigger (80K default):
+                         ├─ if API reports > trigger (80K default):
                          │    1. summarize old messages with Haiku (background, async)
                          │    2. keep ~40K tokens of recent messages verbatim
-                         │    3. apply compressed context on next request
+                         │    3. inject compressed context on next request
                          │
                          └─ never blocks, never adds latency
 ```
@@ -131,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1
 curl http://127.0.0.1:5588/health
 ```
 
-Returns compression stats: how many compressions, tokens saved, active sessions, etc.
+Returns compression stats: how many compressions, tokens saved, etc.
 
 ## How It's Different from `/compact`
 
