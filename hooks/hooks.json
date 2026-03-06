@@ -1,0 +1,16 @@
+{
+  "description": "Rolling Context - auto-start proxy on session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.ps1\" 2>/dev/null || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/on-session-start.sh\" 2>/dev/null",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
