@@ -140,6 +140,7 @@ def _do_background_compression(session_state: dict, messages: list, msg_count: i
 
 class ProxyHandler(BaseHTTPRequestHandler):
     """Handle HTTP requests, proxy to upstream API."""
+    protocol_version = "HTTP/1.1"
 
     # Suppress default access log
     def log_message(self, format, *args):
