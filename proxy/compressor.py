@@ -79,7 +79,8 @@ class RollingCompressor:
         self.compression_count = 0
         self.total_tokens_saved = 0
 
-    def estimate_tokens(self, messages: list) -> int:
+    def _count_chars(self, messages: list) -> int:
+        """Count total characters across all messages."""
         total_chars = 0
         for msg in messages:
             content = msg.get("content", "")
@@ -100,24 +101,29 @@ class RollingCompressor:
                                 for sub in c:
                                     if isinstance(sub, dict):
                                         total_chars += len(sub.get("text", ""))
-        return total_chars // 4
+        return total_chars
 
-    def _find_keep_index(self, messages: list, target: int = None) -> int:
-        if target is None:
-            target = self.target_tokens
+    def estimate_tokens(self, messages: list) -> int:
+        """Rough token estimate for logging. Not used for compression decisions."""
+        return self._count_chars(messages) // 4
+
+    def _find_keep_index(self, messages: list, keep_ratio: float) -> int:
+        """Find the cut point: keep the last keep_ratio fraction of content."""
         if len(messages) <= 4:
             return 0
         max_idx = len(messages) - 4
+        total_chars = self._count_chars(messages)
+        target_chars = int(total_chars * keep_ratio)
         accumulated = 0
         for i in range(len(messages) - 1, -1, -1):
-            msg_tokens = self.estimate_tokens([messages[i]])
-            if accumulated + msg_tokens > target:
+            msg_chars = self._count_chars([messages[i]])
+            if accumulated + msg_chars > target_chars:
                 for j in range(i + 1, len(messages)):
                     if messages[j].get("role") == "user":
                         if not self._has_tool_result(messages[j]):
                             return min(j, max_idx)
                 return min(i + 1, max_idx)
-            accumulated += msg_tokens
+            accumulated += msg_chars
         return 0
 
     def _has_tool_result(self, message: dict) -> bool:
@@ -185,19 +191,19 @@ class RollingCompressor:
 
     def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> list:
         """Compress messages using rolling summarization (synchronous)."""
-        # Scale target using real API token count vs our estimate
-        effective_target = self.target_tokens
-        if real_token_count:
-            estimated = self.estimate_tokens(messages)
-            if estimated > 0:
-                ratio = real_token_count / estimated
-                effective_target = int(self.target_tokens / ratio)
-                log.info(
-                    f"Token scaling: real={real_token_count:,} est={estimated:,} "
-                    f"ratio={ratio:.1f}x, effective_target={effective_target:,}"
-                )
+        # Use real API token count to determine what fraction of content to keep
+        if real_token_count and real_token_count > 0:
+            keep_ratio = self.target_tokens / real_token_count
+            log.info(
+                f"Keep ratio: {keep_ratio:.1%} "
+                f"(target={self.target_tokens:,} / real={real_token_count:,})"
+            )
+        else:
+            # Fallback: keep half (conservative)
+            keep_ratio = 0.5
+            log.info(f"Keep ratio: {keep_ratio:.1%} (fallback, no real token count)")
 
-        keep_from_idx = self._find_keep_index(messages, effective_target)
+        keep_from_idx = self._find_keep_index(messages, keep_ratio)
 
         has_existing_summary = self._has_summary(messages)
         start_idx = 2 if has_existing_summary else 0
