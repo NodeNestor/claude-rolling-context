@@ -68,6 +68,21 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_PORT` | `5588` | Proxy listen port |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
 
+## Proxy Chaining
+
+Already using another proxy (model router, API gateway, etc.)? Rolling Context auto-detects this and chains through it:
+
+```
+Claude Code  ──►  Rolling Context (:5588)  ──►  Your Proxy  ──►  Anthropic API
+```
+
+If `ANTHROPIC_BASE_URL` is already set when you install, the plugin automatically saves it as `ROLLING_CONTEXT_UPSTREAM` and inserts itself in front. No manual config needed.
+
+You can also set it explicitly:
+```bash
+export ROLLING_CONTEXT_UPSTREAM=http://localhost:8080  # your existing proxy
+```
+
 ## How Compression Works
 
 When the message array exceeds the trigger threshold:
