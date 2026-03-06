@@ -13,7 +13,10 @@
       "author": {
         "name": "NodeNestor"
       },
-      "source": ".",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/NodeNestor/claude-rolling-context.git"
+      },
       "category": "productivity",
       "homepage": "https://github.com/NodeNestor/claude-rolling-context"
     }
