@@ -126,7 +126,7 @@ class CompressionStore:
         self._lock = threading.Lock()
         self._compressions = []  # list of compression entries
 
-    def find_match(self, msg_hashes: list):
+    def find_match(self, msg_hashes: list, messages: list = None):
         """Find a compression whose hash chain appears in msg_hashes.
 
         Returns the match whose chain ends furthest into the request
@@ -153,14 +153,29 @@ class CompressionStore:
                         found = True
                         break
                 if not found and chain_len <= len(msg_hashes):
-                    # Find first mismatch at position 0 for debugging
+                    # Count total mismatches
+                    mismatches = []
                     for i in range(min(chain_len, len(msg_hashes))):
                         if oh[i] != msg_hashes[i]:
+                            mismatches.append(i)
+                    log.warning(
+                        f"[MATCH] No match: chain={chain_len} req={len(msg_hashes)} "
+                        f"mismatches={len(mismatches)} at positions: "
+                        f"{mismatches[:10]}{'...' if len(mismatches) > 10 else ''}"
+                    )
+                    # Dump content of first mismatched message for debugging
+                    if mismatches and messages and entry.get("_debug_messages"):
+                        idx = mismatches[0]
+                        stored_msg = entry["_debug_messages"][idx] if idx < len(entry["_debug_messages"]) else None
+                        incoming_msg = messages[idx] if idx < len(messages) else None
+                        if stored_msg and incoming_msg:
+                            s_content = str(stored_msg.get("content", ""))[:500]
+                            i_content = str(incoming_msg.get("content", ""))[:500]
                             log.warning(
-                                f"[MATCH] No match: chain={chain_len} req={len(msg_hashes)} "
-                                f"first mismatch at {i}: stored={oh[i]} got={msg_hashes[i]}"
+                                f"[MATCH] Mismatch at [{idx}] role={stored_msg.get('role')}:\n"
+                                f"  STORED:   {s_content}\n"
+                                f"  INCOMING: {i_content}"
                             )
-                            break
             return best, best_end
 
     def add(self) -> dict:
@@ -255,6 +270,7 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         key_hashes = _hash_messages(summarized[start:])
         entry["pending"] = prefix
         entry["pending_hashes"] = key_hashes
+        entry["_debug_messages"] = summarized[start:]  # for mismatch debugging
         log.info(
             f"[BG] Compression ready: "
             f"{compressor._count_chars(prefix):,} chars "
@@ -451,7 +467,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
 
         # Scan: do any stored compressions match this request's messages?
-        match, match_end = store.find_match(msg_hashes)
+        match, match_end = store.find_match(msg_hashes, messages)
         injected = False
 
         if match and match["prefix"] is not None and match_end > 0:
