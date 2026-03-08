@@ -18,20 +18,7 @@ function Log($msg) {
 
 Log "Hook started. ProxyDir=$ProxyDir"
 
-# Fast check: is proxy already running?
-if (Test-Path $PidFile) {
-    $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($savedPid) {
-        $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-        if ($proc) {
-            Log "Proxy already running (PID $savedPid)"
-            exit 0
-        }
-    }
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-}
-
-# Update Claude Code settings.json with ANTHROPIC_BASE_URL
+# Always update settings.json first (even if proxy is already running)
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
 try {
     if (Test-Path $SettingsFile) {
@@ -78,6 +65,19 @@ try {
     $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
 } catch {
     Log "WARNING: Could not update settings.json: $_"
+}
+
+# Fast check: is proxy already running?
+if (Test-Path $PidFile) {
+    $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
+    if ($savedPid) {
+        $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+        if ($proc) {
+            Log "Proxy already running (PID $savedPid)"
+            exit 0
+        }
+    }
+    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }
 
 # Start proxy directly with system python — no venv needed

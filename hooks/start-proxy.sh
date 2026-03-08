@@ -22,18 +22,7 @@ fi
 
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
-# Fast check: is proxy already running?
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        log "Proxy already running (PID $PID)"
-        exit 0
-    fi
-    log "Stale PID, removing"
-    rm -f "$PIDFILE"
-fi
-
-# Update Claude Code settings.json with ANTHROPIC_BASE_URL
+# Always update settings.json first (even if proxy is already running)
 SETTINGS_FILE="$HOME/.claude/settings.json"
 update_settings() {
     local py_cmd=""
@@ -100,6 +89,17 @@ case "$RESULT" in
     already) log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
     *)       log "WARNING: Could not update settings.json" ;;
 esac
+
+# Fast check: is proxy already running?
+if [ -f "$PIDFILE" ]; then
+    PID=$(cat "$PIDFILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        log "Proxy already running (PID $PID)"
+        exit 0
+    fi
+    log "Stale PID, removing"
+    rm -f "$PIDFILE"
+fi
 
 # Start proxy directly — no venv needed (pure stdlib)
 log "Starting proxy..."
