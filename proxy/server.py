@@ -541,10 +541,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
+                    found_message_start = False
                     for line in text.split("\n"):
                         if line.startswith("data: ") and '"message_start"' in line:
+                            found_message_start = True
                             data = json.loads(line[6:])
                             usage = data.get("message", {}).get("usage", {})
+                            log.info(f"[MSG] message_start usage: {usage}")
                             total_input = (
                                 usage.get("input_tokens", 0)
                                 + usage.get("cache_creation_input_tokens", 0)
@@ -552,7 +555,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             )
                             if total_input > 0:
                                 log.info(f"[MSG] Input tokens from SSE: {total_input:,}")
+                            else:
+                                log.warning(f"[MSG] message_start had zero input tokens!")
                             break
+                    if not found_message_start:
+                        # Log first few SSE events for debugging
+                        sse_lines = [l for l in text.split("\n") if l.startswith("data: ")]
+                        log.warning(
+                            f"[MSG] No message_start found in SSE! "
+                            f"Total events: {len(sse_lines)}, "
+                            f"first event: {sse_lines[0][:200] if sse_lines else 'NONE'}"
+                        )
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse SSE for tokens: {e}")
             elif not is_streaming and buffer:
