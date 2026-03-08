@@ -15,9 +15,9 @@ from urllib.request import Request, urlopen
 
 log = logging.getLogger("rolling-context.compressor")
 
-_default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM", "https://api.anthropic.com")
-SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL", _default_summarizer_url)
-SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY", "")
+_default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
+SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _default_summarizer_url
+SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
 ssl_ctx = ssl.create_default_context()
 
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"

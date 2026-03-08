@@ -40,11 +40,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("rolling-context")
 
-UPSTREAM_URL = os.environ.get("ROLLING_CONTEXT_UPSTREAM", "https://api.anthropic.com")
-LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT", "5588"))
-TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER", "100000"))
-TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET", "40000"))
-SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
+UPSTREAM_URL = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
+LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT") or "5588")
+TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
+TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
+SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or "claude-haiku-4-5-20251001"
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -77,10 +77,25 @@ def _upstream_conn():
 # Content-based matching
 # ---------------------------------------------------------------------------
 
+import re
+
+_VOLATILE_TAGS_RE = re.compile(
+    r"<(?:system-reminder|local-command-caveat|local-command-stdout|"
+    r"available-deferred-tools)>.*?</(?:system-reminder|local-command-caveat|"
+    r"local-command-stdout|available-deferred-tools)>",
+    re.DOTALL,
+)
+
+
+def _strip_volatile_tags(text: str) -> str:
+    """Strip Claude Code's dynamic tags that change between requests."""
+    return _VOLATILE_TAGS_RE.sub("", text)
+
+
 def _normalize_content(content):
-    """Strip volatile metadata (cache_control) for stable hashing."""
+    """Strip volatile metadata (cache_control, system-reminder) for stable hashing."""
     if isinstance(content, str):
-        return content
+        return _strip_volatile_tags(content)
     if isinstance(content, list):
         result = []
         for block in content:
@@ -91,6 +106,8 @@ def _normalize_content(content):
                         continue
                     if k == "content" and isinstance(v, (list, str)):
                         b[k] = _normalize_content(v)
+                    elif k == "text" and isinstance(v, str):
+                        b[k] = _strip_volatile_tags(v)
                     else:
                         b[k] = v
                 result.append(b)

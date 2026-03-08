@@ -58,8 +58,6 @@ try {
         "ROLLING_CONTEXT_TRIGGER" = "100000"
         "ROLLING_CONTEXT_TARGET"  = "40000"
         "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
-        "ROLLING_CONTEXT_SUMMARIZER_URL" = ""
-        "ROLLING_CONTEXT_SUMMARIZER_KEY" = ""
     }
     foreach ($key in $defaults.Keys) {
         if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {

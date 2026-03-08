@@ -73,8 +73,6 @@ defaults = {
     "ROLLING_CONTEXT_TRIGGER": "100000",
     "ROLLING_CONTEXT_TARGET": "40000",
     "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
-    "ROLLING_CONTEXT_SUMMARIZER_URL": "",
-    "ROLLING_CONTEXT_SUMMARIZER_KEY": "",
 }
 for key, value in defaults.items():
     if key not in env:
