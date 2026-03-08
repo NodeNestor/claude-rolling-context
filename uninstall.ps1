@@ -25,6 +25,7 @@ if (Test-Path $PidFile) {
     }
     Remove-Item $PidFile -Force
 }
+Remove-Item (Join-Path $ClaudeDir "rolling-context-proxy.version") -Force -ErrorAction SilentlyContinue
 if (-not $stopped) {
     $conns = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
     if ($conns) {

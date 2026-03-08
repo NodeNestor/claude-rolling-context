@@ -6,10 +6,13 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProxyDir = Join-Path $ScriptDir "..\proxy"
 $ClaudeDir = Join-Path $env:USERPROFILE ".claude"
 $PidFile = Join-Path $ClaudeDir "rolling-context-proxy.pid"
+$VerFile = Join-Path $ClaudeDir "rolling-context-proxy.version"
 $HookLog = Join-Path $ClaudeDir "rolling-context-hook.log"
 $ProxyLog = Join-Path $ClaudeDir "rolling-context-proxy.log"
 $Port = if ($env:ROLLING_CONTEXT_PORT) { $env:ROLLING_CONTEXT_PORT } else { "5588" }
 $ProxyUrl = "http://127.0.0.1:$Port"
+$PluginJson = Join-Path $ScriptDir "..\.claude-plugin\plugin.json"
+$CurrentVersion = if (Test-Path $PluginJson) { (Get-Content $PluginJson -Raw | ConvertFrom-Json).version } else { "unknown" }
 
 function Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -67,17 +70,25 @@ try {
     Log "WARNING: Could not update settings.json: $_"
 }
 
-# Fast check: is proxy already running?
+# Check if proxy is already running
 if (Test-Path $PidFile) {
     $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
     if ($savedPid) {
         $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
         if ($proc) {
-            Log "Proxy already running (PID $savedPid)"
-            exit 0
+            # Check if version changed — restart if so
+            $runningVersion = if (Test-Path $VerFile) { Get-Content $VerFile -ErrorAction SilentlyContinue } else { "" }
+            if ($runningVersion -eq $CurrentVersion) {
+                Log "Proxy already running (PID $savedPid, v$runningVersion)"
+                exit 0
+            }
+            Log "Version changed ($runningVersion -> $CurrentVersion), restarting proxy (PID $savedPid)"
+            Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
         }
     }
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
 }
 
 # Start proxy directly with system python — no venv needed
@@ -87,6 +98,7 @@ $proc = Start-Process -FilePath "python" -ArgumentList "server.py" `
     -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
     -WindowStyle Hidden -PassThru
 $proc.Id | Out-File -FilePath $PidFile -NoNewline
-Log "Proxy started with PID $($proc.Id)"
+$CurrentVersion | Out-File -FilePath $VerFile -NoNewline
+Log "Proxy started with PID $($proc.Id) (v$CurrentVersion)"
 
 exit 0

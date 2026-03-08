@@ -5,9 +5,11 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROXY_DIR="$SCRIPT_DIR/../proxy"
 PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
+VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
 PORT="${ROLLING_CONTEXT_PORT:-5588}"
 PROXY_URL="http://127.0.0.1:$PORT"
+CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
@@ -90,15 +92,22 @@ case "$RESULT" in
     *)       log "WARNING: Could not update settings.json" ;;
 esac
 
-# Fast check: is proxy already running?
+# Check if proxy is already running
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")
     if kill -0 "$PID" 2>/dev/null; then
-        log "Proxy already running (PID $PID)"
-        exit 0
+        # Check if version changed — restart if so
+        RUNNING_VERSION=$(cat "$VERFILE" 2>/dev/null)
+        if [ "$CURRENT_VERSION" = "$RUNNING_VERSION" ]; then
+            log "Proxy already running (PID $PID, v$RUNNING_VERSION)"
+            exit 0
+        fi
+        log "Version changed ($RUNNING_VERSION -> $CURRENT_VERSION), restarting proxy (PID $PID)"
+        kill "$PID" 2>/dev/null
+        sleep 1
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
     fi
-    log "Stale PID, removing"
-    rm -f "$PIDFILE"
+    rm -f "$PIDFILE" "$VERFILE"
 fi
 
 # Start proxy directly — no venv needed (pure stdlib)
@@ -115,7 +124,8 @@ log "Starting proxy..."
     fi
     nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
     echo $! > "$PIDFILE"
-    log "Proxy started with PID $!"
+    echo "$CURRENT_VERSION" > "$VERFILE"
+    log "Proxy started with PID $! (v$CURRENT_VERSION)"
 ) &
 
 exit 0

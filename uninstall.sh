@@ -23,6 +23,7 @@ if [ -f "$PIDFILE" ]; then
     fi
     rm -f "$PIDFILE"
 fi
+rm -f "$CLAUDE_DIR/rolling-context-proxy.version"
 if [ "$STOPPED" = false ]; then
     PROXY_PID=$(lsof -ti:$PORT 2>/dev/null || ss -tlnp "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K\d+' || true)
     if [ -n "$PROXY_PID" ]; then
