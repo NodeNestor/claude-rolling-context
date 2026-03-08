@@ -85,18 +85,51 @@ if 'rolling-context-marketplace' in data:
 "
 fi
 
-# Remove ANTHROPIC_BASE_URL from shell profiles
-for profile in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile"; do
-    if [ -f "$profile" ]; then
-        if grep -q "Rolling Context" "$profile" 2>/dev/null; then
-            sed -i.bak '/# Rolling Context/d' "$profile"
-            sed -i.bak '/ROLLING_CONTEXT/d' "$profile"
-            sed -i.bak '/ANTHROPIC_BASE_URL.*127.0.0.1.*5588/d' "$profile"
-            rm -f "$profile.bak"
-            echo "Cleaned $profile"
-        fi
+# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
+SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+if [ -f "$SETTINGS_FILE" ]; then
+    PY_CMD=""
+    if command -v python3 &>/dev/null; then PY_CMD="python3"
+    elif command -v python &>/dev/null; then PY_CMD="python"
     fi
-done
+    if [ -n "$PY_CMD" ]; then
+        $PY_CMD - "$SETTINGS_FILE" <<'PYEOF'
+import json, sys, os
+
+settings_file = sys.argv[1]
+try:
+    with open(settings_file, "r") as f:
+        settings = json.load(f)
+except (json.JSONDecodeError, IOError):
+    sys.exit(0)
+
+env = settings.get("env", {})
+current = env.get("ANTHROPIC_BASE_URL", "")
+upstream = env.get("ROLLING_CONTEXT_UPSTREAM", "")
+
+if current and "127.0.0.1" in current:
+    if upstream:
+        env["ANTHROPIC_BASE_URL"] = upstream
+        del env["ROLLING_CONTEXT_UPSTREAM"]
+        print(f"Restored ANTHROPIC_BASE_URL to {upstream}")
+    else:
+        del env["ANTHROPIC_BASE_URL"]
+        print("Removed ANTHROPIC_BASE_URL")
+elif "ROLLING_CONTEXT_UPSTREAM" in env:
+    del env["ROLLING_CONTEXT_UPSTREAM"]
+
+# Remove plugin config vars
+for key in list(env.keys()):
+    if key.startswith("ROLLING_CONTEXT_"):
+        del env[key]
+
+settings["env"] = env
+with open(settings_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+    fi
+fi
 
 echo ""
-echo "Uninstalled. Restart your terminal to complete."
+echo "Uninstalled."

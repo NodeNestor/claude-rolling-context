@@ -22,22 +22,60 @@ try {
     exit 1
 }
 
-# 2. Configure ANTHROPIC_BASE_URL as user environment variable
-Write-Host "[2/3] Configuring ANTHROPIC_BASE_URL..."
+# 2. Configure ANTHROPIC_BASE_URL in Claude Code settings.json
+Write-Host "[2/3] Configuring Claude Code settings.json..."
 $ProxyUrl = "http://127.0.0.1:$Port"
-$current = [Environment]::GetEnvironmentVariable("ANTHROPIC_BASE_URL", "User")
-if (-not $current) {
-    [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
-    Write-Host "  Set ANTHROPIC_BASE_URL=$ProxyUrl"
-} elseif ($current -notmatch "127\.0\.0\.1.*$Port") {
-    # Chain through existing proxy
-    [Environment]::SetEnvironmentVariable("ROLLING_CONTEXT_UPSTREAM", $current, "User")
-    [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
-    Write-Host "  Chaining: ANTHROPIC_BASE_URL=$ProxyUrl -> upstream=$current"
-} else {
-    Write-Host "  ANTHROPIC_BASE_URL already set to: $current"
+$SettingsFile = Join-Path $ClaudeDir "settings.json"
+if (-not (Test-Path $ClaudeDir)) {
+    New-Item -ItemType Directory -Path $ClaudeDir -Force | Out-Null
 }
-$env:ANTHROPIC_BASE_URL = $ProxyUrl
+
+try {
+    if (Test-Path $SettingsFile) {
+        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+    } else {
+        $settings = [PSCustomObject]@{}
+    }
+
+    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
+        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
+    }
+
+    $existingUrl = $null
+    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
+        $existingUrl = $settings.env.ANTHROPIC_BASE_URL
+    }
+
+    if (-not $existingUrl) {
+        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+        Write-Host "  Set ANTHROPIC_BASE_URL=$ProxyUrl"
+    } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
+        $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
+        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+        Write-Host "  Chaining: ANTHROPIC_BASE_URL=$ProxyUrl -> upstream=$existingUrl"
+    } else {
+        Write-Host "  ANTHROPIC_BASE_URL already set"
+    }
+
+    # Set plugin config defaults (only if not already present)
+    $defaults = @{
+        "ROLLING_CONTEXT_PORT"    = "5588"
+        "ROLLING_CONTEXT_TRIGGER" = "100000"
+        "ROLLING_CONTEXT_TARGET"  = "40000"
+        "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
+    }
+    foreach ($key in $defaults.Keys) {
+        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
+            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
+        }
+    }
+
+    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    Write-Host "  Settings written to $SettingsFile"
+} catch {
+    Write-Host "  ERROR: Could not update settings.json: $_"
+    exit 1
+}
 
 # 3. Register plugin
 Write-Host "[3/3] Registering Claude Code plugin..."
@@ -65,4 +103,4 @@ $target = if ($env:ROLLING_CONTEXT_TARGET) { $env:ROLLING_CONTEXT_TARGET } else 
 Write-Host "  ROLLING_CONTEXT_TRIGGER = $trigger tokens"
 Write-Host "  ROLLING_CONTEXT_TARGET  = $target tokens"
 Write-Host ""
-Write-Host "Restart your terminal to apply the environment variable."
+Write-Host "Start a new Claude Code session to activate the proxy."

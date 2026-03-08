@@ -26,42 +26,64 @@ else
     exit 1
 fi
 
-# 2. Configure ANTHROPIC_BASE_URL in shell profile
-echo "[2/3] Configuring ANTHROPIC_BASE_URL..."
+# 2. Configure ANTHROPIC_BASE_URL in Claude Code settings.json
+echo "[2/3] Configuring Claude Code settings.json..."
 
-SHELL_PROFILE=""
-if [ -f "$HOME/.zshrc" ]; then
-    SHELL_PROFILE="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-    SHELL_PROFILE="$HOME/.bashrc"
-elif [ -f "$HOME/.bash_profile" ]; then
-    SHELL_PROFILE="$HOME/.bash_profile"
+SETTINGS_FILE="$HOME/.claude/settings.json"
+mkdir -p "$HOME/.claude"
+
+PY_CMD=""
+if command -v python3 &>/dev/null; then PY_CMD="python3"
+elif command -v python &>/dev/null; then PY_CMD="python"
 fi
 
-if [ -n "$SHELL_PROFILE" ]; then
-    if grep -q "ANTHROPIC_BASE_URL" "$SHELL_PROFILE" 2>/dev/null; then
-        EXISTING=$(grep "ANTHROPIC_BASE_URL" "$SHELL_PROFILE" | head -1)
-        if echo "$EXISTING" | grep -q "127\.0\.0\.1.*$PORT"; then
-            echo "  ANTHROPIC_BASE_URL already set in $SHELL_PROFILE"
-        else
-            # Chain through existing proxy
-            echo "export ROLLING_CONTEXT_UPSTREAM=\"\$ANTHROPIC_BASE_URL\"" >> "$SHELL_PROFILE"
-            sed -i.bak "s|export ANTHROPIC_BASE_URL=.*|export ANTHROPIC_BASE_URL=\"$PROXY_URL\"|" "$SHELL_PROFILE"
-            rm -f "$SHELL_PROFILE.bak"
-            echo "  Chaining: ANTHROPIC_BASE_URL=$PROXY_URL -> existing upstream"
-        fi
-    else
-        echo "" >> "$SHELL_PROFILE"
-        echo "# Rolling Context proxy for Claude Code" >> "$SHELL_PROFILE"
-        echo "export ANTHROPIC_BASE_URL=\"$PROXY_URL\"" >> "$SHELL_PROFILE"
-        echo "  Added ANTHROPIC_BASE_URL to $SHELL_PROFILE"
-    fi
-else
-    echo "  Could not detect shell profile. Add this to your shell config manually:"
-    echo "  export ANTHROPIC_BASE_URL=\"$PROXY_URL\""
-fi
+$PY_CMD - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
+import json, sys, os
 
-export ANTHROPIC_BASE_URL="$PROXY_URL"
+settings_file = sys.argv[1]
+proxy_url = sys.argv[2]
+
+settings = {}
+if os.path.exists(settings_file):
+    try:
+        with open(settings_file, "r") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        settings = {}
+
+if "env" not in settings or not isinstance(settings["env"], dict):
+    settings["env"] = {}
+
+env = settings["env"]
+
+existing = env.get("ANTHROPIC_BASE_URL", "")
+if not existing:
+    env["ANTHROPIC_BASE_URL"] = proxy_url
+    print(f"  Set ANTHROPIC_BASE_URL={proxy_url}")
+elif "127.0.0.1" not in existing:
+    env["ROLLING_CONTEXT_UPSTREAM"] = existing
+    env["ANTHROPIC_BASE_URL"] = proxy_url
+    print(f"  Chaining: ANTHROPIC_BASE_URL={proxy_url} -> upstream={existing}")
+else:
+    print(f"  ANTHROPIC_BASE_URL already set")
+
+# Set plugin config defaults (only if not already present)
+defaults = {
+    "ROLLING_CONTEXT_PORT": "5588",
+    "ROLLING_CONTEXT_TRIGGER": "100000",
+    "ROLLING_CONTEXT_TARGET": "40000",
+    "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
+}
+for key, value in defaults.items():
+    if key not in env:
+        env[key] = value
+
+with open(settings_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+print(f"  Settings written to {settings_file}")
+PYEOF
 
 # 3. Register plugin
 echo "[3/3] Registering Claude Code plugin..."
@@ -86,4 +108,4 @@ echo "  ROLLING_CONTEXT_PORT    = $PORT"
 echo "  ROLLING_CONTEXT_TRIGGER = ${ROLLING_CONTEXT_TRIGGER:-80000} tokens"
 echo "  ROLLING_CONTEXT_TARGET  = ${ROLLING_CONTEXT_TARGET:-40000} tokens"
 echo ""
-echo "Restart your terminal or run: source $SHELL_PROFILE"
+echo "Start a new Claude Code session to activate the proxy."

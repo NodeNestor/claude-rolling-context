@@ -33,35 +33,73 @@ if [ -f "$PIDFILE" ]; then
     rm -f "$PIDFILE"
 fi
 
+# Update Claude Code settings.json with ANTHROPIC_BASE_URL
+SETTINGS_FILE="$HOME/.claude/settings.json"
+update_settings() {
+    local py_cmd=""
+    if [ "$IS_WINDOWS" = true ]; then
+        py_cmd="python"
+    elif command -v python3 &>/dev/null; then
+        py_cmd="python3"
+    else
+        py_cmd="python"
+    fi
+
+    $py_cmd - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
+import json, sys, os
+
+settings_file = sys.argv[1]
+proxy_url = sys.argv[2]
+
+settings = {}
+if os.path.exists(settings_file):
+    try:
+        with open(settings_file, "r") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        settings = {}
+
+if "env" not in settings or not isinstance(settings["env"], dict):
+    settings["env"] = {}
+
+env = settings["env"]
+
 # Set ANTHROPIC_BASE_URL
-if [ "$IS_WINDOWS" = true ]; then
-    CURRENT_URL=$(powershell -Command "[Environment]::GetEnvironmentVariable('ANTHROPIC_BASE_URL', 'User')" 2>/dev/null | tr -d '\r')
-    if [ -z "$CURRENT_URL" ]; then
-        powershell -Command "[Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL', '$PROXY_URL', 'User')" 2>/dev/null
-        log "Set ANTHROPIC_BASE_URL=$PROXY_URL"
-    elif ! echo "$CURRENT_URL" | grep -q "127\.0\.0\.1.*$PORT"; then
-        powershell -Command "[Environment]::SetEnvironmentVariable('ROLLING_CONTEXT_UPSTREAM', '$CURRENT_URL', 'User')" 2>/dev/null
-        powershell -Command "[Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL', '$PROXY_URL', 'User')" 2>/dev/null
-        log "Chaining: upstream=$CURRENT_URL"
-    else
-        log "ANTHROPIC_BASE_URL already set"
-    fi
-else
-    if [ -z "$ANTHROPIC_BASE_URL" ]; then
-        SHELL_RC=""
-        if [ -f "$HOME/.zshrc" ]; then SHELL_RC="$HOME/.zshrc"
-        elif [ -f "$HOME/.bashrc" ]; then SHELL_RC="$HOME/.bashrc"
-        elif [ -f "$HOME/.bash_profile" ]; then SHELL_RC="$HOME/.bash_profile"; fi
-        if [ -n "$SHELL_RC" ] && ! grep -q "ANTHROPIC_BASE_URL" "$SHELL_RC" 2>/dev/null; then
-            echo -e "\n# Rolling Context proxy for Claude Code\nexport ANTHROPIC_BASE_URL=$PROXY_URL" >> "$SHELL_RC"
-            log "Added ANTHROPIC_BASE_URL to $SHELL_RC"
-        fi
-    elif ! echo "$ANTHROPIC_BASE_URL" | grep -q "127\.0\.0\.1.*$PORT"; then
-        log "Chaining not yet implemented for this shell rc"
-    else
-        log "ANTHROPIC_BASE_URL already set"
-    fi
-fi
+existing = env.get("ANTHROPIC_BASE_URL", "")
+if not existing:
+    env["ANTHROPIC_BASE_URL"] = proxy_url
+    print("set")
+elif "127.0.0.1" not in existing:
+    env["ROLLING_CONTEXT_UPSTREAM"] = existing
+    env["ANTHROPIC_BASE_URL"] = proxy_url
+    print("chained")
+else:
+    print("already")
+
+# Set plugin config defaults (only if not already present)
+defaults = {
+    "ROLLING_CONTEXT_PORT": "5588",
+    "ROLLING_CONTEXT_TRIGGER": "100000",
+    "ROLLING_CONTEXT_TARGET": "40000",
+    "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
+}
+for key, value in defaults.items():
+    if key not in env:
+        env[key] = value
+
+with open(settings_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+RESULT=$(update_settings 2>/dev/null)
+case "$RESULT" in
+    set)     log "Set ANTHROPIC_BASE_URL=$PROXY_URL (settings.json)" ;;
+    chained) log "Chaining upstream (settings.json)" ;;
+    already) log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
+    *)       log "WARNING: Could not update settings.json" ;;
+esac
 
 # Start proxy directly — no venv needed (pure stdlib)
 log "Starting proxy..."

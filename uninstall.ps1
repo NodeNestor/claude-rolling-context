@@ -81,26 +81,47 @@ if (Test-Path $MarketplacesFile) {
     }
 }
 
-# Restore ANTHROPIC_BASE_URL — if we chained, restore the upstream; otherwise remove
-$upstream = [Environment]::GetEnvironmentVariable("ROLLING_CONTEXT_UPSTREAM", "User")
-$current = [Environment]::GetEnvironmentVariable("ANTHROPIC_BASE_URL", "User")
-if ($current -and $current -match "127\.0\.0\.1.*$Port") {
-    if ($upstream) {
-        [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $upstream, "User")
-        [Environment]::SetEnvironmentVariable("ROLLING_CONTEXT_UPSTREAM", $null, "User")
-        Write-Host "Restored ANTHROPIC_BASE_URL to $upstream"
-    } else {
-        [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $null, "User")
-        Write-Host "Removed ANTHROPIC_BASE_URL"
-    }
-}
+# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
+$SettingsFile = Join-Path $ClaudeDir "settings.json"
+if (Test-Path $SettingsFile) {
+    try {
+        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
 
-# Clean ROLLING_CONTEXT env vars
-foreach ($var in @("ROLLING_CONTEXT_UPSTREAM", "ROLLING_CONTEXT_TRIGGER", "ROLLING_CONTEXT_TARGET", "ROLLING_CONTEXT_MODEL", "ROLLING_CONTEXT_PORT")) {
-    if ([Environment]::GetEnvironmentVariable($var, "User")) {
-        [Environment]::SetEnvironmentVariable($var, $null, "User")
+        if ($settings | Get-Member -Name "env" -MemberType NoteProperty) {
+            $existingUrl = $null
+            $upstream = $null
+            if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
+                $existingUrl = $settings.env.ANTHROPIC_BASE_URL
+            }
+            if ($settings.env | Get-Member -Name "ROLLING_CONTEXT_UPSTREAM" -MemberType NoteProperty) {
+                $upstream = $settings.env.ROLLING_CONTEXT_UPSTREAM
+            }
+
+            if ($existingUrl -and $existingUrl -match "127\.0\.0\.1") {
+                if ($upstream) {
+                    $settings.env.ANTHROPIC_BASE_URL = $upstream
+                    $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_UPSTREAM")
+                    Write-Host "Restored ANTHROPIC_BASE_URL to $upstream"
+                } else {
+                    $settings.env.PSObject.Properties.Remove("ANTHROPIC_BASE_URL")
+                    Write-Host "Removed ANTHROPIC_BASE_URL"
+                }
+            } elseif ($upstream) {
+                $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_UPSTREAM")
+            }
+
+            # Remove plugin config vars
+            $toRemove = $settings.env.PSObject.Properties | Where-Object { $_.Name -like "ROLLING_CONTEXT_*" } | ForEach-Object { $_.Name }
+            foreach ($key in $toRemove) {
+                $settings.env.PSObject.Properties.Remove($key)
+            }
+
+            $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+        }
+    } catch {
+        Write-Host "WARNING: Could not clean settings.json: $_"
     }
 }
 
 Write-Host ""
-Write-Host "Uninstalled. Restart your terminal to complete."
+Write-Host "Uninstalled."

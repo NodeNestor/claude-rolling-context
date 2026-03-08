@@ -31,17 +31,53 @@ if (Test-Path $PidFile) {
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }
 
-# Ensure ANTHROPIC_BASE_URL is set for future sessions
-$currentUrl = [Environment]::GetEnvironmentVariable("ANTHROPIC_BASE_URL", "User")
-if (-not $currentUrl) {
-    [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
-    Log "Set ANTHROPIC_BASE_URL=$ProxyUrl"
-} elseif ($currentUrl -notmatch "127\.0\.0\.1.*$Port") {
-    [Environment]::SetEnvironmentVariable("ROLLING_CONTEXT_UPSTREAM", $currentUrl, "User")
-    [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ProxyUrl, "User")
-    Log "Chaining: upstream=$currentUrl"
-} else {
-    Log "ANTHROPIC_BASE_URL already set"
+# Update Claude Code settings.json with ANTHROPIC_BASE_URL
+$SettingsFile = Join-Path $ClaudeDir "settings.json"
+try {
+    if (Test-Path $SettingsFile) {
+        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+    } else {
+        $settings = [PSCustomObject]@{}
+    }
+
+    # Ensure env object exists
+    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
+        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
+    }
+
+    $existingUrl = $null
+    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
+        $existingUrl = $settings.env.ANTHROPIC_BASE_URL
+    }
+
+    if (-not $existingUrl) {
+        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+        Log "Set ANTHROPIC_BASE_URL=$ProxyUrl (settings.json)"
+    } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
+        # Save existing URL as upstream
+        $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
+        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+        Log "Chaining: upstream=$existingUrl (settings.json)"
+    } else {
+        Log "ANTHROPIC_BASE_URL already set (settings.json)"
+    }
+
+    # Set plugin config defaults (only if not already present)
+    $defaults = @{
+        "ROLLING_CONTEXT_PORT"    = "5588"
+        "ROLLING_CONTEXT_TRIGGER" = "100000"
+        "ROLLING_CONTEXT_TARGET"  = "40000"
+        "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
+    }
+    foreach ($key in $defaults.Keys) {
+        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
+            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
+        }
+    }
+
+    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+} catch {
+    Log "WARNING: Could not update settings.json: $_"
 }
 
 # Start proxy directly with system python — no venv needed
