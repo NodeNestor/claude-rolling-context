@@ -20,6 +20,27 @@ SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _defau
 SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
 ssl_ctx = ssl.create_default_context()
 
+from urllib.parse import urlparse
+_parsed_summarizer_url = urlparse(SUMMARIZER_BASE_URL)
+SUMMARIZER_HOST = _parsed_summarizer_url.netloc
+SUMMARIZER_SCHEME = _parsed_summarizer_url.scheme
+# Preserve summarizer path (e.g. "/api/anthropic" from "https://proxy.example.com/api/anthropic")
+SUMMARIZER_PATH = _parsed_summarizer_url.path or ""
+
+
+def _join_summarizer_path(request_path: str) -> str:
+    """Join summarizer base path with request path, handling edge cases."""
+    if not SUMMARIZER_PATH:
+        return request_path
+    if not request_path or request_path == "/":
+        return SUMMARIZER_PATH
+    # Ensure no double slashes
+    if SUMMARIZER_PATH.endswith("/") and request_path.startswith("/"):
+        return SUMMARIZER_PATH[:-1] + request_path
+    if not SUMMARIZER_PATH.endswith("/") and not request_path.startswith("/"):
+        return SUMMARIZER_PATH + "/" + request_path
+    return SUMMARIZER_PATH + request_path
+
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
 
@@ -257,16 +278,17 @@ class RollingCompressor:
         headers["accept-encoding"] = "identity"
 
         req = Request(
-            f"{SUMMARIZER_BASE_URL}/v1/messages?beta=true",
+            _join_summarizer_path("/v1/messages?beta=true"),
             data=req_body,
             headers=headers,
             method="POST",
         )
         with urlopen(req, context=ssl_ctx, timeout=120) as resp:
+            resp_body = resp.read()
             if resp.status != 200:
-                error = resp.read().decode("utf-8", errors="replace")
+                error = resp_body.decode("utf-8", errors="replace")
                 raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
-            data = json.loads(resp.read())
+            data = json.loads(resp_body)
 
         new_summary = data["content"][0]["text"]
         log.info(f"Summary generated: {len(new_summary):,} chars")
