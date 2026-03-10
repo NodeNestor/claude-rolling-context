@@ -48,6 +48,22 @@ SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or "claude-haiku-4-5-
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
+# Preserve upstream path (e.g. "/api/anthropic" from "https://proxy.example.com/api/anthropic")
+UPSTREAM_PATH = _parsed_upstream.path or ""
+
+
+def _join_path(upstream_path: str, request_path: str) -> str:
+    """Join upstream path with request path, handling edge cases."""
+    if not upstream_path:
+        return request_path
+    if not request_path or request_path == "/":
+        return upstream_path
+    # Ensure no double slashes
+    if upstream_path.endswith("/") and request_path.startswith("/"):
+        return upstream_path[:-1] + request_path
+    if not upstream_path.endswith("/") and not request_path.startswith("/"):
+        return upstream_path + "/" + request_path
+    return upstream_path + request_path
 
 compressor = RollingCompressor(
     trigger_tokens=TRIGGER_TOKENS,
@@ -322,7 +338,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             conn = _upstream_conn()
-            conn.request(method, self.path, body=body if body else None, headers=headers)
+            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            conn.request(method, upstream_full_path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
 
             log.info(f"[RAW] Response: {resp.status} {resp.reason}")
@@ -364,9 +381,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         log.info(f"[REQ] GET {self.path}")
-        if self.path == "/health":
+        # Parse path to handle query strings and prevent path traversal
+        parsed = urlparse(self.path)
+        normalized_path = parsed.path
+        if normalized_path == "/health":
             self._handle_health()
-        elif self.path == "/debug/compressions":
+        elif normalized_path == "/debug/compressions":
             self._handle_debug_compressions()
         else:
             self._proxy_raw("GET")
@@ -532,7 +552,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             conn = _upstream_conn()
-            conn.request("POST", self.path, body=body, headers=headers)
+            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            conn.request("POST", upstream_full_path, body=body, headers=headers)
             resp = conn.getresponse()
 
             log.info(f"[MSG] Upstream response: {resp.status} {resp.reason}")
