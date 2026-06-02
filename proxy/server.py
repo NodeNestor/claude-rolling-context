@@ -40,8 +40,39 @@ logging.basicConfig(
 )
 log = logging.getLogger("rolling-context")
 
-UPSTREAM_URL = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
 LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT") or "5588")
+
+
+def _load_upstream() -> str:
+    """Resolve the upstream API endpoint.
+
+    Prefer ROLLING_CONTEXT_UPSTREAM from the environment. The hook writes it into
+    settings.json but does not export it into this process (issue #3), so fall
+    back to reading settings.json directly — this is what lets the proxy work
+    with custom endpoints (DeepSeek, OpenRouter, a local proxy, a chained PII
+    proxy) instead of always hitting api.anthropic.com.
+    """
+    up = os.environ.get("ROLLING_CONTEXT_UPSTREAM")
+    if up:
+        return up
+    try:
+        settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+        with open(settings_path, encoding="utf-8") as f:
+            env_vars = (json.load(f) or {}).get("env", {}) or {}
+        up = env_vars.get("ROLLING_CONTEXT_UPSTREAM")
+        if up:
+            return up
+        # Last resort: a custom ANTHROPIC_BASE_URL — but never route back at
+        # ourselves (that would loop).
+        base = env_vars.get("ANTHROPIC_BASE_URL", "")
+        if base and (urlparse(base).port or 0) != LISTEN_PORT:
+            return base
+    except Exception:
+        pass
+    return "https://api.anthropic.com"
+
+
+UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or "claude-haiku-4-5-20251001"
