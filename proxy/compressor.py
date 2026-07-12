@@ -212,12 +212,24 @@ class RollingCompressor:
         return 0
 
     def _safe_cut(self, messages: list, cut: int, floor: int) -> int:
-        """Walk cut back until the summarized prefix messages[:cut] ends
-        cleanly: its last message must carry no tool_use blocks, since their
-        tool_results would be cut off and the native compaction request would
-        be rejected. Ending on a tool_result (or plain text) is valid — in
-        agentic sessions that boundary exists after every tool round-trip."""
-        while cut > floor and self._has_tool_use(messages[cut - 1]):
+        """Walk cut back to a boundary where messages[cut:] is a valid start.
+
+        Two rules, both enforced by the real API:
+        - messages[cut] must be a plain 'user' message (no tool_result). If it's
+          an assistant, a tool_result, or a 'system' directive, the injected
+          prefix [summary(user), ack(assistant)] can't legally precede it — a
+          system message in particular must sit between a user turn and a
+          following assistant turn (user, system, assistant), so it can never
+          be the first kept message.
+        - messages[cut-1] (last summarized) must carry no tool_use, or its
+          tool_results would be orphaned in the kept half.
+        """
+        while cut > floor:
+            m = messages[cut]
+            starts_clean = m.get("role") == "user" and not self._has_tool_result(m)
+            prev_clean = not self._has_tool_use(messages[cut - 1])
+            if starts_clean and prev_clean:
+                return cut
             cut -= 1
         return cut
 
