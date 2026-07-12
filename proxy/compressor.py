@@ -4,9 +4,27 @@ Rolling Context Compressor
 When context exceeds trigger_tokens, compresses old messages down to target_tokens
 of recent context + a dense chronological summary of everything before.
 
+Two summarization modes:
+
+1. NATIVE (default): clones the exact request Claude Code just sent — same
+   model, system prompt, tools, and message history up to the cut point — and
+   appends one user message asking for the summary. Because the request is
+   byte-identical Claude Code session traffic, it passes Anthropic's
+   subscription OAuth classification (issue #4), and because the prefix was
+   just sent by the chat request, it's a prompt-cache read instead of full
+   input cost.
+
+2. FLATTENED: used when a custom summarizer is configured
+   (ROLLING_CONTEXT_SUMMARIZER_URL / _KEY / _FORMAT). Flattens the
+   conversation to text and sends a standalone request — Anthropic format or
+   OpenAI chat-completions format, so any local model or third-party API
+   works (Ollama, LM Studio, vLLM, OpenRouter, DeepSeek, ...).
+
 Pure stdlib — no external dependencies.
 """
 
+import copy
+import gzip
 import json
 import os
 import ssl
@@ -17,8 +35,15 @@ from urllib.parse import urlparse
 log = logging.getLogger("rolling-context.compressor")
 
 _default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
+SUMMARIZER_URL_SET = bool(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL"))
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _default_summarizer_url
 SUMMARIZER_API_KEY = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_KEY") or ""
+# "anthropic" (default) or "openai" — openai speaks /v1/chat/completions
+SUMMARIZER_FORMAT = (os.environ.get("ROLLING_CONTEXT_SUMMARIZER_FORMAT") or "anthropic").lower()
+# Any custom summarizer config switches off native mode
+NATIVE_MODE = not (SUMMARIZER_URL_SET or SUMMARIZER_API_KEY or SUMMARIZER_FORMAT != "anthropic")
+LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
 ssl_ctx = ssl.create_default_context()
 
 _parsed_summarizer = urlparse(SUMMARIZER_BASE_URL)
@@ -28,20 +53,20 @@ _SUMMARIZER_SCHEME = _parsed_summarizer.scheme
 _SUMMARIZER_PATH = _parsed_summarizer.path or ""
 
 
-def _summarizer_conn():
+def _summarizer_conn(timeout=600):
     """Create a connection to the summarizer server (same style as server.py)."""
     if _SUMMARIZER_SCHEME == "https":
         return http.client.HTTPSConnection(
             _SUMMARIZER_HOST,
             _SUMMARIZER_PORT or 443,
             context=ssl_ctx,
-            timeout=120,
+            timeout=timeout,
         )
     else:
         return http.client.HTTPConnection(
             _SUMMARIZER_HOST,
             _SUMMARIZER_PORT or 80,
-            timeout=120,
+            timeout=timeout,
         )
 
 
@@ -57,14 +82,19 @@ def _join_path(upstream_path: str, request_path: str) -> str:
         return upstream_path + "/" + request_path
     return upstream_path + request_path
 
+def _clean_headers(headers: dict) -> dict:
+    """Drop hop-by-hop/stale headers case-insensitively. The passthrough
+    headers keep Claude Code's original casing (e.g. Accept-Encoding), so
+    plain dict assignment of 'accept-encoding' would DUPLICATE the header and
+    the upstream would still gzip the response."""
+    drop = ("accept-encoding", "content-length", "host", "transfer-encoding", "connection")
+    return {k: v for k, v in headers.items() if k.lower() not in drop}
+
+
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
 
-SUMMARIZE_PROMPT = """You are a context compressor for an AI coding assistant conversation.
-
-Your job: take the conversation below and produce a CHRONOLOGICAL, DENSE technical summary.
-
-RULES:
+SUMMARY_RULES = """RULES:
 - Structure as a TIMELINE: use numbered steps showing what happened in order
 - Preserve ALL file paths, function/class/variable names EXACTLY as written
 - Preserve ALL technical decisions and WHY they were made
@@ -93,12 +123,30 @@ FORMAT:
 - [What's done, what's in progress, what's next]
 
 ## Key Details
-- [File paths, configs, decisions that must not be forgotten]
+- [File paths, configs, decisions that must not be forgotten]"""
 
-{existing_summary_section}
+# Native mode: appended as the final user message after the real conversation,
+# like Claude Code's own /compact. Contains "context compressor" so test mocks
+# can recognize summarization requests.
+NATIVE_COMPACT_PROMPT = f"""Stop working on the current task. Act as a context compressor: produce a CHRONOLOGICAL, DENSE technical summary of our conversation above.
+
+{SUMMARY_RULES}
+
+If the conversation begins with a {SUMMARY_MARKER} block from an earlier compression, integrate it — keep all its details and extend the timeline with what happened since.
+
+Write ONLY the chronological summary, nothing else."""
+
+# Flattened mode: standalone prompt carrying the conversation as text.
+SUMMARIZE_PROMPT = f"""You are a context compressor for an AI coding assistant conversation.
+
+Your job: take the conversation below and produce a CHRONOLOGICAL, DENSE technical summary.
+
+{SUMMARY_RULES}
+
+{{existing_summary_section}}
 
 CONVERSATION TO COMPRESS:
-{conversation}
+{{conversation}}
 
 Write the chronological summary:"""
 
@@ -108,10 +156,12 @@ class RollingCompressor:
         self,
         trigger_tokens: int = 80000,
         target_tokens: int = 40000,
-        summarizer_model: str = "claude-haiku-latest",
+        summarizer_model: str = "",
     ):
         self.trigger_tokens = trigger_tokens
         self.target_tokens = target_tokens
+        # Empty = native mode uses the session's own model (prompt-cache hit);
+        # flattened mode falls back to LEGACY_DEFAULT_MODEL.
         self.summarizer_model = summarizer_model
         self.compression_count = 0
         self.total_tokens_saved = 0
@@ -158,6 +208,24 @@ class RollingCompressor:
                 return min(i + 1, max_idx)
             accumulated += msg_chars
         return 0
+
+    def _safe_cut(self, messages: list, cut: int, floor: int) -> int:
+        """Walk cut back until the summarized prefix messages[:cut] ends
+        cleanly: its last message must carry no tool_use blocks, since their
+        tool_results would be cut off and the native compaction request would
+        be rejected. Ending on a tool_result (or plain text) is valid — in
+        agentic sessions that boundary exists after every tool round-trip."""
+        while cut > floor and self._has_tool_use(messages[cut - 1]):
+            cut -= 1
+        return cut
+
+    def _has_tool_use(self, message: dict) -> bool:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    return True
+        return False
 
     def _has_tool_result(self, message: dict) -> bool:
         content = message.get("content", "")
@@ -222,8 +290,196 @@ class RollingCompressor:
             parts.append(f"**{role}**: {text}")
         return "\n\n".join(parts)
 
-    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> list:
-        """Compress messages using rolling summarization (synchronous)."""
+    # ------------------------------------------------------------------
+    # Native mode: clone the session's own request, append "compact this"
+    # ------------------------------------------------------------------
+
+    def _count_breakpoints(self, payload: dict, convo: list) -> int:
+        """Count cache_control breakpoints across system, tools, and convo."""
+        count = 0
+        system = payload.get("system")
+        if isinstance(system, list):
+            for block in system:
+                if isinstance(block, dict) and "cache_control" in block:
+                    count += 1
+        for tool in payload.get("tools") or []:
+            if isinstance(tool, dict) and "cache_control" in tool:
+                count += 1
+        for msg in convo:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        count += 1
+        return count
+
+    def _summarize_native(self, payload: dict, messages: list, cut: int, auth_headers: dict) -> str:
+        """Send the session's own request shape with a compact instruction.
+
+        The conversation prefix is identical to what Claude Code just sent, so
+        upstream serves it from the prompt cache, and subscription OAuth
+        classification sees genuine Claude Code session traffic.
+        """
+        convo = list(messages[:cut])
+
+        # Place a cache breakpoint on the last conversation message (budget
+        # permitting, max 4 per request) so the lookup reads the deepest
+        # cache entry created by earlier chat requests.
+        if convo and self._count_breakpoints(payload, convo) < 4:
+            last = copy.deepcopy(convo[-1])
+            c = last.get("content")
+            if isinstance(c, str):
+                last["content"] = [{
+                    "type": "text",
+                    "text": c,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            elif isinstance(c, list) and c and isinstance(c[-1], dict):
+                c[-1]["cache_control"] = {"type": "ephemeral"}
+            convo[-1] = last
+
+        model = self.summarizer_model or payload.get("model", LEGACY_DEFAULT_MODEL)
+        max_tokens = 16000
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "messages": convo + [{"role": "user", "content": NATIVE_COMPACT_PROMPT}],
+        }
+        for key in ("system", "tools", "metadata"):
+            if payload.get(key) is not None:
+                body[key] = payload[key]
+        if body.get("tools"):
+            # The summary must be text — without this the model may answer
+            # the cloned request with a tool_use and the summary comes back empty
+            body["tool_choice"] = {"type": "none"}
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            body["thinking"] = thinking
+            body["max_tokens"] = max(max_tokens, int(thinking.get("budget_tokens", 0)) + 4000)
+
+        req_body = json.dumps(body).encode()
+        headers = _clean_headers(auth_headers)
+        headers["content-length"] = str(len(req_body))
+        headers["accept-encoding"] = "identity"
+
+        summarizer_path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+        log.info(
+            f"Native compaction request -> {SUMMARIZER_BASE_URL} "
+            f"model={model} messages={len(body['messages'])} ({len(req_body):,} bytes)"
+        )
+
+        conn = _summarizer_conn()
+        conn.request("POST", summarizer_path, body=req_body, headers=headers)
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        if resp_body[:2] == b"\x1f\x8b":  # upstream gzipped despite identity
+            resp_body = gzip.decompress(resp_body)
+
+        if resp.status != 200:
+            error = resp_body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
+
+        parts = []
+        for line in resp_body.decode("utf-8", errors="replace").split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            evt = data.get("type", "")
+            if evt == "message_start":
+                usage = data.get("message", {}).get("usage", {})
+                log.info(
+                    f"Native compaction usage: input={usage.get('input_tokens', 0):,} "
+                    f"cache_read={usage.get('cache_read_input_tokens', 0):,} "
+                    f"cache_write={usage.get('cache_creation_input_tokens', 0):,}"
+                )
+            elif evt == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    parts.append(delta.get("text", ""))
+            elif evt == "error":
+                raise RuntimeError(f"Summarization stream error: {json.dumps(data)[:500]}")
+        summary = "".join(parts).strip()
+        if not summary:
+            snippet = resp_body.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"Summarization returned empty text; response starts: {snippet}")
+        return summary
+
+    # ------------------------------------------------------------------
+    # Flattened mode: standalone request to a custom summarizer
+    # ------------------------------------------------------------------
+
+    def _summarize_flattened(self, prompt: str, auth_headers: dict) -> str:
+        summary_max_tokens = 16000
+        model = self.summarizer_model or LEGACY_DEFAULT_MODEL
+
+        if SUMMARIZER_FORMAT == "openai":
+            if not self.summarizer_model:
+                raise RuntimeError(
+                    "ROLLING_CONTEXT_SUMMARIZER_FORMAT=openai requires "
+                    "ROLLING_CONTEXT_MODEL to name the summarizer model"
+                )
+            path = _join_path(_SUMMARIZER_PATH, "/v1/chat/completions")
+            req_body = json.dumps({
+                "model": model,
+                "max_tokens": summary_max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode()
+            headers = {"content-type": "application/json"}
+            if SUMMARIZER_API_KEY:
+                headers["authorization"] = f"Bearer {SUMMARIZER_API_KEY}"
+        else:
+            path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
+            req_body = json.dumps({
+                "model": model,
+                "max_tokens": summary_max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode()
+            if SUMMARIZER_API_KEY:
+                headers = {
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": SUMMARIZER_API_KEY,
+                }
+            else:
+                headers = _clean_headers(auth_headers)
+        headers["content-length"] = str(len(req_body))
+        headers["accept-encoding"] = "identity"
+
+        log.info(
+            f"Compression request -> {SUMMARIZER_BASE_URL} path={path} "
+            f"format={SUMMARIZER_FORMAT} model={model}"
+        )
+
+        conn = _summarizer_conn(timeout=120)
+        conn.request("POST", path, body=req_body, headers=headers)
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        if resp_body[:2] == b"\x1f\x8b":  # upstream gzipped despite identity
+            resp_body = gzip.decompress(resp_body)
+
+        if resp.status != 200:
+            error = resp_body.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
+        data = json.loads(resp_body)
+
+        if SUMMARIZER_FORMAT == "openai":
+            return data["choices"][0]["message"]["content"]
+        return data["content"][0]["text"]
+
+    # ------------------------------------------------------------------
+
+    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None,
+                 payload: dict = None) -> list:
+        """Compress messages using rolling summarization (synchronous).
+
+        Returns the compressed message list, or None when there is nothing
+        worth compressing (callers must not build a compression entry then)."""
         # Use real API token count to determine what fraction of content to keep
         if real_token_count and real_token_count > 0:
             keep_ratio = self.target_tokens / real_token_count
@@ -241,73 +497,42 @@ class RollingCompressor:
         has_existing_summary = self._has_summary(messages)
         start_idx = 2 if has_existing_summary else 0
 
+        keep_from_idx = self._safe_cut(messages, keep_from_idx, start_idx)
+
         if keep_from_idx <= start_idx:
             log.info("Not enough old messages to compress, passing through")
-            return messages
+            return None
 
-        existing_summary = self._extract_summary(messages) if has_existing_summary else ""
-        to_compress = messages[start_idx:keep_from_idx]
         recent_messages = messages[keep_from_idx:]
 
-        if not to_compress:
-            log.info("Nothing to compress")
-            return messages
-
-        conversation_text = self._messages_to_text(to_compress)
-
-        summary_max_tokens = 16000
-
-        existing_section = ""
-        if existing_summary:
-            existing_section = (
-                "EXISTING ROLLING SUMMARY FROM PREVIOUS COMPRESSIONS "
-                "(integrate this timeline with the new conversation below — "
-                "keep all details, extend the timeline):\n"
-                f"{existing_summary}\n\n"
-            )
-
-        prompt = SUMMARIZE_PROMPT.format(
-            existing_summary_section=existing_section,
-            conversation=conversation_text,
-        )
-
-        log.info(
-            f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
-            f"with {self.summarizer_model} (max_tokens={summary_max_tokens:,})..."
-        )
-
-        req_body = json.dumps({
-            "model": self.summarizer_model,
-            "max_tokens": summary_max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        }).encode()
-
-        if SUMMARIZER_API_KEY:
-            headers = {
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": SUMMARIZER_API_KEY,
-            }
+        use_native = NATIVE_MODE and payload is not None
+        if use_native:
+            new_summary = self._summarize_native(payload, messages, keep_from_idx, auth_headers)
         else:
-            headers = dict(auth_headers)
-        headers["content-length"] = str(len(req_body))
-        headers["accept-encoding"] = "identity"
+            existing_summary = self._extract_summary(messages) if has_existing_summary else ""
+            to_compress = messages[start_idx:keep_from_idx]
+            if not to_compress:
+                log.info("Nothing to compress")
+                return None
+            conversation_text = self._messages_to_text(to_compress)
+            existing_section = ""
+            if existing_summary:
+                existing_section = (
+                    "EXISTING ROLLING SUMMARY FROM PREVIOUS COMPRESSIONS "
+                    "(integrate this timeline with the new conversation below — "
+                    "keep all details, extend the timeline):\n"
+                    f"{existing_summary}\n\n"
+                )
+            prompt = SUMMARIZE_PROMPT.format(
+                existing_summary_section=existing_section,
+                conversation=conversation_text,
+            )
+            log.info(
+                f"Summarizing {keep_from_idx - start_idx} messages "
+                f"({len(conversation_text):,} chars, flattened)..."
+            )
+            new_summary = self._summarize_flattened(prompt, auth_headers)
 
-        summarizer_path = _join_path(_SUMMARIZER_PATH, "/v1/messages")
-        log.info(f"Compression request -> {SUMMARIZER_BASE_URL} path={summarizer_path}")
-
-        conn = _summarizer_conn()
-        conn.request("POST", summarizer_path, body=req_body, headers=headers)
-        resp = conn.getresponse()
-        resp_body = resp.read()
-        conn.close()
-
-        if resp.status != 200:
-            error = resp_body.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
-        data = json.loads(resp_body)
-
-        new_summary = data["content"][0]["text"]
         log.info(f"Summary generated: {len(new_summary):,} chars")
 
         summary_message = {

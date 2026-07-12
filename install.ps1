@@ -62,12 +62,17 @@ try {
         "ROLLING_CONTEXT_PORT"    = "5588"
         "ROLLING_CONTEXT_TRIGGER" = "100000"
         "ROLLING_CONTEXT_TARGET"  = "40000"
-        "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
     }
     foreach ($key in $defaults.Keys) {
         if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
             $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
         }
+    }
+    # Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
+    # (prompt-cache hit). Migrate away the old seeded haiku default.
+    if (($settings.env | Get-Member -Name "ROLLING_CONTEXT_MODEL" -MemberType NoteProperty) -and
+        $settings.env.ROLLING_CONTEXT_MODEL -eq "claude-haiku-4-5-20251001") {
+        $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_MODEL")
     }
 
     $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8

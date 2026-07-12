@@ -104,6 +104,35 @@ The summary preserves a structured record of everything that happened:
 
 Goals evolve naturally across rolling compressions — the latest request stays prominent while completed goals move to the previous section. User instructions are never lost.
 
+### How the summary is generated (native mode)
+
+By default the proxy doesn't build a separate summarization request. It **clones the exact request Claude Code just sent** — same model, system prompt, and tools, with the conversation truncated at the cut point — and appends one user message asking for the summary (the same way Claude Code's own `/compact` works). Two big wins:
+
+- **It's a prompt-cache read.** The cloned prefix was just sent by the chat request, so the API serves it from cache. Measured in practice: a ~72K-token compression request cost ~400 fresh input tokens.
+- **It's genuine Claude Code session traffic.** Pro/Max subscription OAuth tokens are classified server-side — standalone requests that don't look like Claude Code get routed to the overage lane and rejected with 429. The cloned request passes because it *is* the session's own request shape.
+
+Setting `ROLLING_CONTEXT_MODEL` pins a different summarizer model (the request shape stays native, but a different model means no prompt-cache reuse). Configuring any `ROLLING_CONTEXT_SUMMARIZER_*` variable switches to a standalone flattened request instead — see below.
+
+### Using any API or a local model for compression
+
+Summarization can run on a completely separate endpoint — any Anthropic-format API, or any OpenAI-compatible one (Ollama, LM Studio, vLLM, OpenRouter, DeepSeek, Groq, ...):
+
+```bash
+# Separate Anthropic API key (billed there instead of your subscription)
+export ROLLING_CONTEXT_SUMMARIZER_KEY=sk-ant-api03-...
+
+# Local model via Ollama / LM Studio / vLLM (OpenAI-compatible)
+export ROLLING_CONTEXT_SUMMARIZER_URL=http://127.0.0.1:11434
+export ROLLING_CONTEXT_SUMMARIZER_FORMAT=openai
+export ROLLING_CONTEXT_MODEL=qwen3:8b   # required for openai format
+
+# OpenRouter (or any hosted OpenAI-compatible API)
+export ROLLING_CONTEXT_SUMMARIZER_URL=https://openrouter.ai/api
+export ROLLING_CONTEXT_SUMMARIZER_FORMAT=openai
+export ROLLING_CONTEXT_SUMMARIZER_KEY=sk-or-...
+export ROLLING_CONTEXT_MODEL=deepseek/deepseek-chat
+```
+
 ## Architecture
 
 The proxy is **fully stateless** — no sessions, no databases, no tracking. It works by hashing message content:
@@ -126,11 +155,13 @@ All settings via environment variables (all optional — defaults work great):
 |----------|---------|-------------|
 | `ROLLING_CONTEXT_TRIGGER` | `100000` | Compress when context exceeds this many tokens |
 | `ROLLING_CONTEXT_TARGET` | `40000` | Keep this many tokens of recent messages after compression |
-| `ROLLING_CONTEXT_MODEL` | `claude-haiku-4-5-20251001` | Model used for summarization |
+| `ROLLING_CONTEXT_MODEL` | *(session model)* | Summarizer model; unset = the session's own model (prompt-cache hit) |
 | `ROLLING_CONTEXT_PORT` | `5588` | Proxy listen port |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
-| `ROLLING_CONTEXT_SUMMARIZER_URL` | `https://api.anthropic.com` | Custom endpoint for summarization (e.g. local vLLM) |
+| `ROLLING_CONTEXT_SUMMARIZER_URL` | *(upstream)* | Custom endpoint for summarization (local model, other API) |
 | `ROLLING_CONTEXT_SUMMARIZER_KEY` | *(uses Claude Code auth)* | API key for custom summarizer endpoint |
+| `ROLLING_CONTEXT_SUMMARIZER_FORMAT` | `anthropic` | `openai` = /v1/chat/completions for OpenAI-compatible endpoints |
+| `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
 
 ## Proxy Chaining
 

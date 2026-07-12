@@ -1,7 +1,7 @@
 {
   "name": "rolling-context",
-  "version": "1.7.2",
-  "description": "Rolling context compression — old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
+  "version": "1.8.0",
+  "description": "Rolling context compression \u00e2\u20ac\u201d old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
   "author": {
     "name": "NodeNestor"
   },

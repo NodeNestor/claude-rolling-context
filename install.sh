@@ -72,11 +72,15 @@ defaults = {
     "ROLLING_CONTEXT_PORT": "5588",
     "ROLLING_CONTEXT_TRIGGER": "100000",
     "ROLLING_CONTEXT_TARGET": "40000",
-    "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
 }
 for key, value in defaults.items():
     if key not in env:
         env[key] = value
+
+# Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
+# (prompt-cache hit). Migrate away the old seeded haiku default.
+if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
+    del env["ROLLING_CONTEXT_MODEL"]
 
 with open(settings_file, "w") as f:
     json.dump(settings, f, indent=2)

@@ -18,6 +18,7 @@ import os
 import sys
 import logging
 import threading
+import time
 import ssl
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -75,7 +76,12 @@ def _load_upstream() -> str:
 UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
-SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or "claude-haiku-4-5-20251001"
+# Empty = native mode compresses with the session's own model (prompt-cache
+# hit); set to pin a specific summarizer model.
+SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
+# After a failed compression, wait this long before trying again — otherwise a
+# failing summarizer (e.g. rate-limited) gets re-hammered on every request.
+FAILURE_COOLDOWN = int(os.environ.get("ROLLING_CONTEXT_FAILURE_COOLDOWN") or "300")
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -311,11 +317,21 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None):
+_compression_failed_at = 0.0
+
+
+def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
+                               real_token_count: int = None, payload: dict = None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
+    global _compression_failed_at
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
-        compressed = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
+        compressed = compressor.compress(messages, auth_headers,
+                                         real_token_count=real_token_count, payload=payload)
+        if compressed is None:
+            # Nothing worth compressing — don't leave an empty entry behind
+            store.remove(entry)
+            return
         # compressed = [summary, ack] + recent_verbatim
         # Prefix = ONLY [summary, ack] — verbatim messages come from the
         # original request during injection, so including them in the prefix
@@ -341,7 +357,11 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
             f"summarized {len(summarized) - start} messages)"
         )
     except Exception as e:
-        log.error(f"[BG] Compression failed: {e}", exc_info=True)
+        _compression_failed_at = time.time()
+        log.error(
+            f"[BG] Compression failed (cooling down {FAILURE_COOLDOWN}s): {e}",
+            exc_info=True,
+        )
         entry["pending"] = None
 
 
@@ -470,11 +490,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             1 for e in store.compressions
             if e["thread"] is not None and e["thread"].is_alive()
         )
+        from compressor import NATIVE_MODE, SUMMARIZER_FORMAT
         data = {
             "status": "ok",
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
-            "summarizer_model": SUMMARIZER_MODEL,
+            "summarizer_model": SUMMARIZER_MODEL or "(session model)",
+            "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
             "upstream_url": UPSTREAM_URL,
             "compression_count": compressor.compression_count,
             "total_tokens_saved": compressor.total_tokens_saved,
@@ -692,13 +714,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"{msg_chars:,} chars -> ~{total_input:,} tokens"
                 )
 
-            # Trigger compression based on token count
-            if total_input > 0 and total_input > TRIGGER_TOKENS:
+            # Trigger compression based on token count. The minimum message
+            # count keeps us from "compressing" sessions whose bulk is the
+            # system prompt / first-message context, which we can't remove.
+            if total_input > 0 and total_input > TRIGGER_TOKENS and len(current_messages) >= 6:
                 already_compressing = any(
                     e["thread"] is not None and e["thread"].is_alive()
                     for e in store.compressions
                 )
-                if not already_compressing:
+                cooldown_left = FAILURE_COOLDOWN - (time.time() - _compression_failed_at)
+                if already_compressing:
+                    pass
+                elif cooldown_left > 0:
+                    log.info(
+                        f"[MSG] Over trigger but last compression failed — "
+                        f"cooling down another {cooldown_left:.0f}s"
+                    )
+                else:
                     log.info(
                         f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
                         f"Compressing in background..."
@@ -707,7 +739,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),
-                        kwargs={"real_token_count": total_input},
+                        kwargs={"real_token_count": total_input, "payload": payload},
                         daemon=True,
                     )
                     t.start()
@@ -740,10 +772,13 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def main():
+    from compressor import NATIVE_MODE, SUMMARIZER_FORMAT
     log.info(f"Starting Rolling Context Proxy on port {LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
-    log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
+    log.info(f"  Summarizer model: {SUMMARIZER_MODEL or '(session model)'}")
+    log.info(f"  Summarizer mode: "
+             f"{'native (cloned session request, prompt-cached)' if NATIVE_MODE else f'flattened/{SUMMARIZER_FORMAT}'}")
     log.info(f"  Forwarding to: {UPSTREAM_URL}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
