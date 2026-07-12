@@ -540,16 +540,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Replace everything up to match_end with the prefix
             # (prefix contains summary of everything before it)
             new_messages = messages[match_end:]
-            merged = match["prefix"] + new_messages
-            merged = _validate_tool_pairs(merged)
 
-            # Strip cache_control from injected messages
-            for msg in merged:
+            # Strip cache_control from injected prefix messages ONLY.
+            # The verbatim tail keeps Claude Code's cache_control breakpoints —
+            # stripping those disabled prompt caching entirely, so every request
+            # after the first injection paid full input-token cost (issue #1/#4).
+            for msg in match["prefix"]:
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict):
                             block.pop("cache_control", None)
+
+            merged = match["prefix"] + new_messages
+            merged = _validate_tool_pairs(merged)
 
             merged_chars = compressor._count_chars(merged)
             if merged_chars < msg_chars:
