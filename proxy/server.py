@@ -574,7 +574,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if isinstance(block, dict):
                             block.pop("cache_control", None)
 
-            merged = match["prefix"] + new_messages
+            prefix = match["prefix"]
+            if new_messages and new_messages[0].get("role") == "system":
+                # Claude Code can put system-directive messages in the array;
+                # the API requires them to follow a user message. Our ack is a
+                # plain assistant message, so drop it and let the directive
+                # follow the (user-role) summary instead (issue #4 follow-up).
+                prefix = prefix[:1]
+            merged = prefix + new_messages
             merged = _validate_tool_pairs(merged)
 
             merged_chars = compressor._count_chars(merged)
