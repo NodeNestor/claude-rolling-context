@@ -128,7 +128,9 @@ FORMAT:
 # Native mode: appended as the final user message after the real conversation,
 # like Claude Code's own /compact. Contains "context compressor" so test mocks
 # can recognize summarization requests.
-NATIVE_COMPACT_PROMPT = f"""Stop working on the current task. Act as a context compressor: produce a CHRONOLOGICAL, DENSE technical summary of our conversation above.
+NATIVE_COMPACT_PROMPT = f"""Pause the current task. Act as a context compressor: produce a CHRONOLOGICAL, DENSE technical summary of the conversation above.
+
+IMPORTANT: this compression request is NOT part of the conversation. Do not mention it in the summary, do not add it to the timeline, and do not treat it as the user's request. The Active Goal is the user's most recent REAL request from the conversation above — the task in progress continues after compression exactly where it left off, so summarize it as in-progress work, not as interrupted.
 
 {SUMMARY_RULES}
 
