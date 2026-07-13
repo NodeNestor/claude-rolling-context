@@ -10,16 +10,43 @@ A transparent proxy that gives Claude Code **rolling context compression** — o
 
 > Claude Code's built-in `/compact` replaces your **entire** conversation with a lossy summary. After a few compactions, you're summarizing a summary of a summary. This plugin only compresses old messages — recent context stays untouched.
 
+It's also a cost story: every token you carry in context gets re-billed on **every turn** (at cache-read rates), so an unmanaged session's input cost grows with the *square* of its length. Capping the prefix makes it linear — [the math](#the-economics-why-capping-the-prefix-matters) works in relative units and holds for every model, and it matters more the bigger the context window, not less.
+
 ## `/compact` vs Rolling Context
 
 | | `/compact` (built-in) | Rolling Context |
 |---|---|---|
 | What gets compressed | Everything | Only old messages |
 | Recent context | Summarized (lossy) | **Kept verbatim** |
-| When it runs | Manual or at threshold | Automatic, background |
+| When it runs | Manual or near the context limit | Automatic, background |
 | Latency impact | Blocks until done | Zero — async |
 | After multiple compressions | Summary of summary of summary | Fresh rolling merge each time |
+| Input cost over a long session | Grows with the square of session length | Grows linearly |
 | Original transcript | Replaced | Preserved (JSONL unchanged) |
+
+## The economics: why capping the prefix matters
+
+No price cards needed — the argument works in **relative units** that hold for every Claude model. Take the model's fresh-input-token rate as `1×`. The API bills:
+
+| Operation | Relative cost |
+|---|---|
+| Fresh input tokens | `1×` |
+| Prompt-cache **read** | `0.1×` |
+| Prompt-cache **write** | `1.25×` (5-min TTL) / `2×` (1-hour TTL) |
+| Output tokens | `~5×` |
+
+Claude Code re-sends the entire conversation on every turn. Even with caching working perfectly, each turn costs `prefix size × 0.1`. So a session's total input cost is **the sum of the prefix over all turns**:
+
+- **Unmanaged context** (big window, auto-compact only near the limit): the prefix grows every turn, so total cost grows with the *square* of session length. A 1M window doesn't fix this — it just lets the prefix run to 900K+ before anything stops it, and every one of those tokens costs `0.1×` again on every single turn.
+- **Rolling context**: the prefix is capped between `TARGET` and `TRIGGER`, so total cost grows *linearly*.
+
+**The cache-miss blast radius matters even more in interactive use.** The prompt cache has a TTL. Read a diff, think for a while, get coffee — and the next turn re-*writes* the whole prefix at `1.25×`. At a 900K prefix, one cold turn bills the equivalent of ~1.1M fresh input tokens. With the prefix capped at ~100K, the identical cold turn is ~9× cheaper. Compression doesn't just shrink the average turn — it caps the worst one.
+
+**What compression itself costs:** each cycle re-writes the new (much smaller) prefix once, and in native mode the summarization request is itself a cache read — a few hundred fresh tokens, measured (see below). Ballpark: sessions that accumulate past ~100K of context — a couple of hours of real work — come out ahead, and the gap compounds from there. Short sessions are a wash; don't expect magic on a 20-minute task.
+
+**On Pro/Max subscriptions** none of this is dollars, but the same math applies in a different currency: rate-limit accounting weights cache reads far below fresh input, so the identical curves decide how fast you burn your 5-hour window.
+
+> **Honest note:** if cost were the *only* goal, lowering Claude Code's auto-compact threshold (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) buys a similar spend curve for free. What it can't buy is quality under repetition: built-in compaction replaces the whole conversation with a lossy summary every time it fires — at a low threshold it fires often, and you're soon working from a summary of a summary of a summary. The rolling design exists so aggressive compression doesn't cost you the session: recent work stays verbatim, and old work lives in one continuously-merged timeline instead of N generations of loss.
 
 ## How It Works
 
@@ -29,7 +56,9 @@ Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Anthropic API
                          ├─ context < 100K tokens? pass through unchanged
                          │
                          └─ context > 100K tokens?
-                              1. summarize old messages with Haiku (background, async)
+                              1. summarize old messages in the background
+                                 (native mode: your session's own model,
+                                  served almost entirely from prompt cache)
                               2. keep ~40K tokens of recent messages verbatim
                               3. inject compressed context on next request
                               4. never blocks, never adds latency
@@ -210,7 +239,7 @@ cd $HOME\claude-rolling-context; powershell -ExecutionPolicy Bypass -File uninst
 
 If you installed via marketplace and already deleted the repo, you can run it from the cache:
 ```powershell
-cd $HOME\.claude\plugins\cache\rolling-context-marketplace\rolling-context\1.0.0
+cd $HOME\.claude\plugins\cache\rolling-context-marketplace\rolling-context\<version>
 powershell -ExecutionPolicy Bypass -File uninstall.ps1
 ```
 
