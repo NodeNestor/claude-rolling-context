@@ -319,6 +319,11 @@ def _validate_tool_pairs(messages: list) -> list:
 
 _compression_failed_at = 0.0
 
+# Wall-clock time of the last compression injection — the moment old messages
+# actually left the model's context. Exposed at /lean/status so companion
+# plugins (nestor-lean) can invalidate "the model already saw this" knowledge.
+_last_injection_ts = 0.0
+
 
 def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
                                real_token_count: int = None, payload: dict = None):
@@ -437,6 +442,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif normalized_path == "/debug/compressions":
             self._handle_debug_compressions()
+        elif normalized_path == "/lean/status":
+            self._handle_lean_status()
         else:
             self._proxy_raw("GET")
 
@@ -479,6 +486,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         info["prefix_content"] = content
             entries.append(info)
         body = json.dumps(entries, indent=2).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_lean_status(self):
+        """Machine-readable status for companion plugins (nestor-lean).
+
+        last_injection_ts is global across all conversations flowing through
+        this proxy — consumers must treat it as a conservative signal (a
+        compression in ANY session invalidates, which only costs savings,
+        never correctness).
+        """
+        data = {
+            "status": "ok",
+            "last_injection_ts": _last_injection_ts,
+            "stored_compressions": len(store.compressions),
+        }
+        body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -588,6 +615,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 payload["messages"] = merged
                 msg_chars = merged_chars
                 injected = True
+                global _last_injection_ts
+                _last_injection_ts = time.time()
             else:
                 log.info(
                     f"[MSG] Compression no longer helps: "
