@@ -499,7 +499,16 @@ class RollingCompressor:
 
         if SUMMARIZER_FORMAT == "openai":
             return data["choices"][0]["message"]["content"]
-        return data["content"][0]["text"]
+        # Not content[0] blindly: an endpoint with thinking enabled puts a
+        # thinking block first, and a misbehaving one can return no blocks at
+        # all. A bare KeyError/IndexError here tells the user nothing about
+        # which endpoint misbehaved or how.
+        for block in data.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text", "")
+        raise RuntimeError(
+            f"Summarizer at {SUMMARIZER_BASE_URL} returned no text block; "
+            f"response: {json.dumps(data)[:300]}")
 
     # ------------------------------------------------------------------
 

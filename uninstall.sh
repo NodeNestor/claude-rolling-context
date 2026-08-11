@@ -99,9 +99,16 @@ import json, sys, os
 
 settings_file = sys.argv[1]
 try:
-    with open(settings_file, "r") as f:
+    # utf-8-sig: without it a BOM'd settings.json (every Windows install before
+    # v1.11.3) failed to parse here and the uninstall silently did nothing —
+    # leaving ANTHROPIC_BASE_URL pointed at a proxy that is about to stop
+    # existing, which breaks Claude Code entirely.
+    with open(settings_file, "r", encoding="utf-8-sig") as f:
         settings = json.load(f)
-except (json.JSONDecodeError, IOError):
+except (json.JSONDecodeError, IOError, OSError, UnicodeDecodeError):
+    print("WARNING: settings.json could not be parsed — ANTHROPIC_BASE_URL not cleaned.")
+    print("         Remove the 127.0.0.1 ANTHROPIC_BASE_URL entry by hand or Claude Code")
+    print("         will keep pointing at the removed proxy.")
     sys.exit(0)
 
 env = settings.get("env", {})
@@ -125,7 +132,7 @@ for key in list(env.keys()):
         del env[key]
 
 settings["env"] = env
-with open(settings_file, "w") as f:
+with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 PYEOF

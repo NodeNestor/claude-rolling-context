@@ -1,4 +1,4 @@
-# Ensure rolling context proxy is running (Windows)
+﻿# Ensure rolling context proxy is running (Windows)
 # Pure stdlib — no venv needed, just python
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -70,7 +70,14 @@ try {
         $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_MODEL")
     }
 
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    # NOT `Set-Content -Encoding UTF8`: on Windows PowerShell 5.1 that writes a
+    # UTF-8 BOM, which Python's json reader rejects. The proxy then lost the
+    # custom upstream (issues #3/#5 all over again), and the bash fallback hook
+    # read the same file, failed to parse it, and rewrote it from scratch —
+    # destroying permissions, hooks and enabledPlugins. Write BOM-less UTF-8
+    # explicitly; identical behaviour on 5.1 and 7+.
+    $json = $settings | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding $false))
 } catch {
     Log "WARNING: Could not update settings.json: $_"
 }

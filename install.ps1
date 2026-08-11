@@ -1,4 +1,4 @@
-# Install the Rolling Context plugin for Claude Code (Windows)
+﻿# Install the Rolling Context plugin for Claude Code (Windows)
 #
 # Run: powershell -ExecutionPolicy Bypass -File install.ps1
 
@@ -75,7 +75,11 @@ try {
         $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_MODEL")
     }
 
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    # BOM-less: `Set-Content -Encoding UTF8` writes a BOM on Windows PowerShell
+    # 5.1, which Python's json reader rejects — that is the bug this release
+    # fixes, so the installer must not recreate it. See hooks/start-proxy.ps1.
+    $json = $settings | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding $false))
     Write-Host "  Settings written to $SettingsFile"
 } catch {
     Write-Host "  ERROR: Could not update settings.json: $_"

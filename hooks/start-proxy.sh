@@ -45,10 +45,24 @@ proxy_url = sys.argv[2]
 settings = {}
 if os.path.exists(settings_file):
     try:
-        with open(settings_file, "r") as f:
+        # utf-8-sig, not the locale default: a UTF-8 BOM must not read as a
+        # corrupt file. On Windows the PowerShell hook wrote one, and git-bash
+        # shares the same $HOME, so this script saw a BOM'd file, called it
+        # unparseable, and rewrote it from {} below.
+        with open(settings_file, "r", encoding="utf-8-sig") as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        settings = {}
+    except (json.JSONDecodeError, IOError, OSError, UnicodeDecodeError):
+        # Refuse to write. The file exists but we cannot read it, and
+        # regenerating it from {} would destroy the user's entire global
+        # config — permissions, hooks, enabledPlugins, theme, all of it.
+        # Losing the proxy chaining is recoverable; losing their settings
+        # is not.
+        print("unreadable")
+        sys.exit(0)
+
+if not isinstance(settings, dict):
+    print("unreadable")
+    sys.exit(0)
 
 if "env" not in settings or not isinstance(settings["env"], dict):
     settings["env"] = {}
@@ -82,7 +96,7 @@ for key, value in defaults.items():
 if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
     del env["ROLLING_CONTEXT_MODEL"]
 
-with open(settings_file, "w") as f:
+with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 PYEOF
@@ -93,6 +107,8 @@ case "$RESULT" in
     set)     log "Set ANTHROPIC_BASE_URL=$PROXY_URL (settings.json)" ;;
     chained) log "Chaining upstream (settings.json)" ;;
     already) log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
+    unreadable)
+        log "WARNING: settings.json exists but could not be parsed — left untouched." ;;
     *)       log "WARNING: Could not update settings.json" ;;
 esac
 
