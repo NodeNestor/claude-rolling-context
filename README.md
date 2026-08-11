@@ -318,9 +318,16 @@ Two files live in `~/.claude`:
 Before v1.11.3 the proxy logged at `DEBUG` unconditionally into an unrotated
 file *and* duplicated every line into the second one. A long-lived proxy could
 reach several gigabytes (issue #7). If you are upgrading, delete the old files
-once — nothing prunes them retroactively:
+once — nothing prunes them retroactively.
+
+**Stop the proxy first.** A running proxy holds both files open, so deleting
+them frees no disk at all until the process exits — the space only comes back
+on restart. Reported by @drewdrewthis after clearing a 6.86 GB log and finding
+the disk unchanged:
 
 ```bash
+# stop the proxy (it restarts automatically on the next Claude Code session)
+kill "$(cat ~/.claude/rolling-context-proxy.pid)" 2>/dev/null
 rm -f ~/.claude/rolling-context-proxy.log ~/.claude/rolling-context-debug.log
 ```
 
