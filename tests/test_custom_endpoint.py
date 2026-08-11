@@ -51,10 +51,15 @@ def wait_port(port, timeout=20):
     return False
 
 
-def fake_home(root, settings_env):
+def fake_home(root, settings_env, bom=False):
     home = os.path.join(root, "home")
     os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
-    with open(os.path.join(home, ".claude", "settings.json"), "w", encoding="utf-8") as f:
+    # bom=True reproduces what Windows PowerShell 5.1's `Set-Content -Encoding
+    # UTF8` left behind (the start hook's own write, until v1.11.3). Only ever
+    # writing BOM-less files is precisely why this suite stayed green while
+    # every Windows user's custom endpoint was being silently ignored.
+    encoding = "utf-8-sig" if bom else "utf-8"
+    with open(os.path.join(home, ".claude", "settings.json"), "w", encoding=encoding) as f:
         json.dump({"env": settings_env}, f)
     return home
 
@@ -85,32 +90,52 @@ def resolution_cases(root):
     cases = [
         ("plain Anthropic user is unaffected",
          {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5588"}, {},
-         {"upstream": ANTHROPIC, "summarizer": ANTHROPIC, "native": True, "fallback": False}),
+         {"upstream": ANTHROPIC, "summarizer": ANTHROPIC, "native": True, "fallback": False},
+         False),
 
         ("custom endpoint chained by the hook reaches the summarizer",
          {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5588",
           "ROLLING_CONTEXT_UPSTREAM": CUSTOM}, {},
-         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True}),
+         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True},
+         False),
 
         ("bare custom ANTHROPIC_BASE_URL is picked up",
          {"ANTHROPIC_BASE_URL": CUSTOM}, {},
-         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True}),
+         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True},
+         False),
 
         ("env var still wins over settings.json",
          {"ROLLING_CONTEXT_UPSTREAM": "https://from-settings.example"},
          {"ROLLING_CONTEXT_UPSTREAM": "https://from-env.example"},
          {"upstream": "https://from-env.example", "summarizer": "https://from-env.example",
-          "native": True, "fallback": True}),
+          "native": True, "fallback": True},
+         False),
 
         ("explicit summarizer override still disables native mode",
          {"ROLLING_CONTEXT_UPSTREAM": CUSTOM},
          {"ROLLING_CONTEXT_SUMMARIZER_URL": ANTHROPIC},
-         {"upstream": CUSTOM, "summarizer": ANTHROPIC, "native": False, "fallback": False}),
+         {"upstream": CUSTOM, "summarizer": ANTHROPIC, "native": False, "fallback": False},
+         False),
+
+        # Same as case 2, but the file carries a UTF-8 BOM. Before v1.11.3 the
+        # reader used encoding="utf-8", which raises on a BOM; the exception was
+        # swallowed and the custom endpoint vanished, sending every compaction
+        # to api.anthropic.com with the wrong key.
+        ("BOM'd settings.json still yields the custom endpoint",
+         {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5588",
+          "ROLLING_CONTEXT_UPSTREAM": CUSTOM}, {},
+         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True},
+         True),
+
+        ("BOM'd bare ANTHROPIC_BASE_URL is picked up",
+         {"ANTHROPIC_BASE_URL": CUSTOM}, {},
+         {"upstream": CUSTOM, "summarizer": CUSTOM, "native": True, "fallback": True},
+         True),
     ]
 
     failures = 0
-    for name, settings, extra, want in cases:
-        home = fake_home(os.path.join(root, "res"), settings)
+    for name, settings, extra, want, bom in cases:
+        home = fake_home(os.path.join(root, "res"), settings, bom=bom)
         out = subprocess.run([sys.executable, "-c", PROBE], cwd=PROXY,
                              env=clean_env(home, **extra),
                              capture_output=True, text=True)
@@ -199,11 +224,107 @@ def live_case(root, strict):
     return sum(1 for _, ok in checks if not ok)
 
 
+# ---------------------------------------------------------------- part C ----
+# The hook rewrites the user's GLOBAL settings.json on every session start. If
+# it cannot parse the file it must leave it alone: regenerating it from {}
+# destroys permissions, hooks, enabledPlugins and everything else the user has.
+# Losing the proxy chaining is recoverable; losing their config is not.
+
+REAL_CONFIG = {
+    "env": {"ANTHROPIC_BASE_URL": CUSTOM},
+    "permissions": {"allow": ["Bash(git:*)", "WebSearch"]},
+    "hooks": {"SessionStart": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "important-user-hook.ps1"}]}]},
+    "enabledPlugins": {"rolling-context@nestor-plugins": True},
+    "theme": "dark",
+}
+
+
+def hook_python(tmpdir):
+    """Extract the settings-updating python out of hooks/start-proxy.sh.
+
+    Deliberately reads the shipped hook rather than a copy: if the heredoc
+    changes, this test changes with it.
+    """
+    sh = os.path.join(HERE, "..", "hooks", "start-proxy.sh")
+    with open(sh, encoding="utf-8") as f:
+        body = f.read()
+    block = body.split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
+    path = os.path.join(tmpdir, "hookblock.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(block)
+    return path
+
+
+def preservation_cases(root):
+    cases = [
+        ("BOM-less config", "plain", True),
+        # PowerShell 5.1 wrote this; git-bash shares $HOME, so the sh hook read
+        # it, called it corrupt, and rewrote the file from scratch.
+        ("BOM'd config (PowerShell-written)", "bom", True),
+        # Genuinely unparseable: chaining must be skipped, file left untouched.
+        ("truly corrupt config", "corrupt", False),
+    ]
+
+    failures = 0
+    for label, mode, should_chain in cases:
+        work = os.path.join(root, "preserve", mode)
+        os.makedirs(work, exist_ok=True)
+        settings_file = os.path.join(work, "settings.json")
+
+        if mode == "corrupt":
+            raw = "{ this is not json at all"
+            with open(settings_file, "w", encoding="utf-8") as f:
+                f.write(raw)
+        else:
+            enc = "utf-8-sig" if mode == "bom" else "utf-8"
+            with open(settings_file, "w", encoding=enc) as f:
+                json.dump(REAL_CONFIG, f, indent=2)
+
+        before = open(settings_file, "rb").read()
+        subprocess.run([sys.executable, hook_python(work), settings_file,
+                        "http://127.0.0.1:5588"], capture_output=True, text=True)
+        after_bytes = open(settings_file, "rb").read()
+
+        if mode == "corrupt":
+            ok = after_bytes == before
+            print(("  PASS  " if ok else "  FAIL  ")
+                  + f"{label}: left byte-for-byte untouched")
+            if not ok:
+                print(f"          file was rewritten: {after_bytes[:80]!r}")
+            failures += not ok
+            continue
+
+        after = json.loads(after_bytes.decode("utf-8-sig"))
+        lost = [k for k in REAL_CONFIG if k not in after]
+        ok = not lost
+        print(("  PASS  " if ok else "  FAIL  ") + f"{label}: user config survives")
+        if lost:
+            print(f"          DESTROYED top-level keys: {lost}")
+        failures += not ok
+
+        chained = after.get("env", {}).get("ROLLING_CONTEXT_UPSTREAM")
+        ok2 = (chained == CUSTOM) if should_chain else (chained is None)
+        print(("  PASS  " if ok2 else "  FAIL  ") + f"{label}: custom upstream chained")
+        if not ok2:
+            print(f"          want {CUSTOM if should_chain else None!r}, got {chained!r}")
+        failures += not ok2
+
+        # The hook must not reintroduce the BOM that started all this.
+        ok3 = not after_bytes.startswith(b"\xef\xbb\xbf")
+        print(("  PASS  " if ok3 else "  FAIL  ") + f"{label}: written without a BOM")
+        failures += not ok3
+
+    return failures
+
+
 def main():
     root = tempfile.mkdtemp(prefix="rolling-context-test-")
     try:
         print("endpoint resolution")
         failures = resolution_cases(root)
+        print("\nglobal settings.json preservation")
+        failures += preservation_cases(root)
         print("\nlive proxy against a mock endpoint")
         failures += live_case(root, strict=False)
         failures += live_case(root, strict=True)
