@@ -7,19 +7,30 @@ endpoint or leaked off to api.anthropic.com.
   python mock_endpoint.py <port> <logfile>
 
 Env:
-  MOCK_STRICT=1        reject requests carrying cache_control / tool_choice,
-                       the way a shallower /v1/messages implementation does
-  MOCK_INPUT_TOKENS=N  input_tokens to report (drives the compression trigger)
+  MOCK_STRICT=1          reject requests carrying cache_control / tool_choice,
+                         the way a shallower /v1/messages implementation does
+  MOCK_INPUT_TOKENS=N    input_tokens to report (drives the compression trigger)
+  MOCK_COMPACTION_DELAY  seconds to hold a compaction request open, so tests can
+                         put a second conversation in flight while the first is
+                         still compressing
+  MOCK_TOKENS_FROM_SIZE  report input_tokens derived from the actual request
+                         instead of a constant, so a conversation that got its
+                         summary injected falls back under the trigger the way a
+                         real one does. A constant makes every conversation
+                         demand compaction forever, which is not a real workload.
 """
 import json
 import os
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 LOG = sys.argv[2]
 BIG_INPUT = int(os.environ.get("MOCK_INPUT_TOKENS", "150000"))
 STRICT = os.environ.get("MOCK_STRICT") == "1"
+COMPACTION_DELAY = float(os.environ.get("MOCK_COMPACTION_DELAY", "0") or 0)
+TOKENS_FROM_SIZE = os.environ.get("MOCK_TOKENS_FROM_SIZE") == "1"
 
 COMPACTION_MARKER = "context compressor"
 SUMMARY_MARKER = "summary of our earlier conversation"
@@ -52,6 +63,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         msgs = payload.get("messages") or []
         is_compaction = COMPACTION_MARKER in (json.dumps(msgs[-1]) if msgs else "")
+        reported_input = (max(1, len(json.dumps(msgs)) // 4) if TOKENS_FROM_SIZE
+                          else BIG_INPUT)
 
         note("request", {
             "path": self.path,
@@ -72,6 +85,9 @@ class Handler(BaseHTTPRequestHandler):
                               "message": f"unsupported field: {bad}"}}).encode())
                 return
 
+        if is_compaction and COMPACTION_DELAY:
+            time.sleep(COMPACTION_DELAY)
+
         reply = ("SUMMARY: the conversation so far, densely compacted."
                  if is_compaction else "ok")
         model = payload.get("model", "glm-4.6")
@@ -81,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "msg_mock", "type": "message", "role": "assistant",
                 "model": model, "content": [{"type": "text", "text": reply}],
                 "stop_reason": "end_turn",
-                "usage": {"input_tokens": BIG_INPUT, "output_tokens": 12},
+                "usage": {"input_tokens": reported_input, "output_tokens": 12},
             }).encode())
             return
 
@@ -89,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             {"type": "message_start", "message": {
                 "id": "msg_mock", "type": "message", "role": "assistant",
                 "model": model, "content": [], "stop_reason": None,
-                "usage": {"input_tokens": BIG_INPUT, "output_tokens": 1,
+                "usage": {"input_tokens": reported_input, "output_tokens": 1,
                           "cache_creation_input_tokens": 0,
                           "cache_read_input_tokens": 0}}},
             {"type": "content_block_start", "index": 0,
@@ -108,4 +124,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     note("start", {"port": PORT, "strict": STRICT})
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()

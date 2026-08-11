@@ -91,7 +91,16 @@ TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
 # After a failed compression, wait this long before trying again — otherwise a
 # failing summarizer (e.g. rate-limited) gets re-hammered on every request.
+# Scoped per conversation: a single global timestamp meant one conversation's
+# failure silenced every other conversation on the machine for 5 minutes.
 FAILURE_COOLDOWN = int(os.environ.get("ROLLING_CONTEXT_FAILURE_COOLDOWN") or "300")
+# Ceiling on concurrent background compactions across all conversations. This
+# exists to bound cost and upstream rate-limit pressure, NOT to serialise work:
+# before v1.11.4 the limit was effectively 1 and applied globally, so one
+# conversation compacting starved every other conversation of a compression
+# entry — which is why only ~21% of eligible requests were ever injected (#8).
+MAX_CONCURRENT_COMPACTIONS = max(
+    1, int(os.environ.get("ROLLING_CONTEXT_MAX_CONCURRENT") or "4"))
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -434,7 +443,47 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
-_compression_failed_at = 0.0
+# Failure timestamps per conversation, not one global clock. The global version
+# meant a single rate-limited conversation put every other conversation on the
+# machine into a FAILURE_COOLDOWN-long silence (#8).
+_compression_failures = {}          # conversation key -> time.time() of failure
+_failure_lock = threading.Lock()
+
+# Injection accounting, so "is this thing actually working?" is answerable from
+# the log at INFO instead of requiring DEBUG and a transcript scrape (#8).
+_stats = {"injected": 0, "missed": 0}
+_stats_lock = threading.Lock()
+
+
+def _conversation_key(session_id: str, msg_hashes: list) -> str:
+    """Identify a conversation for concurrency accounting ONLY.
+
+    Never used for matching — the store stays content-addressed, so this cannot
+    reintroduce session coupling. Claude Code sends X-Claude-Code-Session-Id;
+    when it is absent (older builds, other clients) the first message hash is
+    stable for the life of a conversation and is good enough to keep one
+    conversation from blocking another.
+    """
+    if session_id:
+        return "sid:" + session_id
+    return "msg:" + (msg_hashes[0] if msg_hashes else "empty")
+
+
+def _note_compression_failure(owner: str):
+    now = time.time()
+    with _failure_lock:
+        _compression_failures[owner] = now
+        if len(_compression_failures) > 512:
+            cutoff = now - FAILURE_COOLDOWN
+            for k in [k for k, v in _compression_failures.items() if v < cutoff]:
+                _compression_failures.pop(k, None)
+
+
+def _cooldown_remaining(owner: str) -> float:
+    with _failure_lock:
+        failed_at = _compression_failures.get(owner, 0.0)
+    return FAILURE_COOLDOWN - (time.time() - failed_at)
+
 
 # Wall-clock time of the last compression injection — the moment old messages
 # actually left the model's context. Exposed at /lean/status so companion
@@ -445,7 +494,6 @@ _last_injection_ts = 0.0
 def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
                                real_token_count: int = None, payload: dict = None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
-    global _compression_failed_at
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
         compressed = compressor.compress(messages, auth_headers,
@@ -479,9 +527,11 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
             f"summarized {len(summarized) - start} messages)"
         )
     except Exception as e:
-        _compression_failed_at = time.time()
+        owner = entry.get("owner") or ""
+        _note_compression_failure(owner)
         log.error(
-            f"[BG] Compression failed (cooling down {FAILURE_COOLDOWN}s): {e}",
+            f"[BG] Compression failed (this conversation cools down "
+            f"{FAILURE_COOLDOWN}s; others are unaffected): {e}",
             exc_info=True,
         )
         entry["pending"] = None
@@ -908,6 +958,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"{msg_chars:,} chars -> ~{total_input:,} tokens"
                 )
 
+            # Injection accounting (#8). Whether the proxy is actually doing its
+            # job should be answerable from INFO logs, not by correlating
+            # session transcripts against DEBUG output.
+            if not disabled:
+                with _stats_lock:
+                    if injected:
+                        _stats["injected"] += 1
+                    elif total_input > TRIGGER_TOKENS:
+                        _stats["missed"] += 1
+                    seen = _stats["injected"] + _stats["missed"]
+                    if seen and seen % 25 == 0:
+                        log.info(
+                            f"[STATS] prefix injected on {_stats['injected']}/{seen} "
+                            f"requests at or over the trigger "
+                            f"({_stats['injected'] / seen * 100:.0f}%)"
+                        )
+
             # Trigger compression based on token count. The minimum message
             # count keeps us from "compressing" sessions whose bulk is the
             # system prompt / first-message context, which we can't remove.
@@ -918,17 +985,56 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"rolling-context is OFF — not compressing"
                     )
             elif total_input > 0 and total_input > TRIGGER_TOKENS and len(current_messages) >= 6:
-                already_compressing = any(
+                convo_key = _conversation_key(session_id, msg_hashes)
+                # Per conversation, not process-global. The old check scanned
+                # every entry in the store, so ANY conversation compacting
+                # blocked ALL others — and did so via a bare `pass`, with no log
+                # line, which is why it never showed up in anyone's logs. Most
+                # conversations never won the race, never got a compression
+                # entry, and so never had anything to inject on later turns (#8).
+                mine_compressing = any(
                     e["thread"] is not None and e["thread"].is_alive()
+                    and e.get("owner") == convo_key
                     for e in store.compressions
                 )
-                cooldown_left = FAILURE_COOLDOWN - (time.time() - _compression_failed_at)
-                if already_compressing:
-                    pass
+                in_flight = sum(
+                    1 for e in store.compressions
+                    if e["thread"] is not None and e["thread"].is_alive()
+                )
+                # A conversation with no usable compression yet is paying full
+                # context cost on every single turn, and it is precisely the one
+                # a busy machine starves: it always arrives to find the slots
+                # taken. So the cap applies to REFRESHES only, and cold starts
+                # are admitted up to a hard ceiling. Making the cap absolute
+                # reintroduced #8 in a new form — measured: with 5 other
+                # conversations running, the sixth never compressed at all.
+                has_usable = any(
+                    e.get("owner") == convo_key and e.get("prefix") is not None
+                    for e in store.compressions
+                )
+                cooldown_left = _cooldown_remaining(convo_key)
+                if mine_compressing:
+                    log.info(
+                        "[MSG] Over trigger, but this conversation is already "
+                        "compressing — skipping"
+                    )
+                elif in_flight >= MAX_CONCURRENT_COMPACTIONS * 2:
+                    log.info(
+                        f"[MSG] Over trigger, but {in_flight} compactions are in "
+                        f"flight (hard ceiling {MAX_CONCURRENT_COMPACTIONS * 2}) "
+                        f"— skipping. Raise ROLLING_CONTEXT_MAX_CONCURRENT if "
+                        f"this is frequent."
+                    )
+                elif in_flight >= MAX_CONCURRENT_COMPACTIONS and has_usable:
+                    log.info(
+                        f"[MSG] Over trigger, but {in_flight} compactions are in "
+                        f"flight (cap {MAX_CONCURRENT_COMPACTIONS}) and this "
+                        f"conversation already has a summary — deferring refresh"
+                    )
                 elif cooldown_left > 0:
                     log.info(
-                        f"[MSG] Over trigger but last compression failed — "
-                        f"cooling down another {cooldown_left:.0f}s"
+                        f"[MSG] Over trigger but this conversation's last "
+                        f"compression failed — cooling down another {cooldown_left:.0f}s"
                     )
                 else:
                     log.info(
@@ -936,6 +1042,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"Compressing in background..."
                     )
                     entry = store.add()
+                    entry["owner"] = convo_key
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

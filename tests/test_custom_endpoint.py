@@ -161,13 +161,16 @@ def conversation(pairs, tail):
     return msgs
 
 
-def post(port, msgs):
+def post(port, msgs, sid=""):
+    headers = {"content-type": "application/json", "x-api-key": "custom-endpoint-key",
+               "anthropic-version": "2023-06-01"}
+    if sid:
+        headers["X-Claude-Code-Session-Id"] = sid
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/messages",
         data=json.dumps({"model": "glm-4.6", "max_tokens": 64,
                          "stream": True, "messages": msgs}).encode(),
-        headers={"content-type": "application/json", "x-api-key": "custom-endpoint-key",
-                 "anthropic-version": "2023-06-01"},
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=60) as r:
         r.read()
@@ -471,6 +474,106 @@ def logging_cases(root):
     return failures
 
 
+# ---------------------------------------------------------------- part F ----
+# Issue #8: the compaction guard was process-global. ANY conversation compacting
+# silently blocked EVERY other conversation from starting one — via a bare
+# `pass`, so nothing was logged and it never showed up in anyone's logs. Most
+# conversations therefore never got a compression entry at all, and so had
+# nothing to inject on later turns. The reporter measured injection on 633 of
+# 2,962 eligible requests (21.4%) over 16.5 hours.
+#
+# The trap this test exists to avoid: the mock must be threaded and must report
+# token counts from the actual request. A single-threaded mock serialises the
+# proxy and hides the bug (it produced a false negative during diagnosis), and a
+# constant token count makes every conversation demand compaction forever, which
+# is not a real workload.
+
+def distinct_conversation(tag, filler, pairs=24):
+    """A conversation that shares NO message with any other tag.
+
+    conversation() above builds the same 24 pairs every time and varies only the
+    last message, so one conversation's summary matches another's prefix — which
+    made an earlier version of this test pass against the unfixed server for
+    entirely the wrong reason.
+    """
+    msgs = []
+    for i in range(pairs):
+        msgs.append({"role": "user", "content": f"{tag} question {i} " + filler * 400})
+        msgs.append({"role": "assistant", "content": f"{tag} answer {i} " + filler * 400})
+    msgs.append({"role": "user", "content": f"{tag}: do the thing"})
+    return msgs
+
+
+def concurrency_case(root):
+    print("  two conversations, one compacting")
+    failures = 0
+    mock_port, proxy_port = free_port(), free_port()
+    work = os.path.join(root, "concurrency")
+    os.makedirs(work, exist_ok=True)
+    log = os.path.join(work, "mock.jsonl")
+
+    home = fake_home(work, {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{proxy_port}",
+                            "ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{mock_port}"})
+    env = clean_env(home, ROLLING_CONTEXT_PORT=str(proxy_port),
+                    ROLLING_CONTEXT_TRIGGER="1000", ROLLING_CONTEXT_TARGET="400")
+    mock = subprocess.Popen(
+        [sys.executable, MOCK, str(mock_port), log],
+        env=dict(os.environ, MOCK_COMPACTION_DELAY="4", MOCK_TOKENS_FROM_SIZE="1"))
+    proxy = subprocess.Popen([sys.executable, "server.py"], cwd=PROXY, env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert wait_port(mock_port), "mock endpoint did not start"
+        assert wait_port(proxy_port), "proxy did not start"
+
+        alpha = distinct_conversation("ALPHA", "a")
+        bravo = distinct_conversation("BRAVO", "b")
+
+        post(proxy_port, alpha, sid="session-alpha")
+        time.sleep(1.0)                     # ALPHA's compaction is still running
+        post(proxy_port, bravo, sid="session-bravo")
+        time.sleep(8)                       # let both compactions finish
+
+        # Second turn each: both should now carry a summary.
+        a2 = alpha + [{"role": "assistant", "content": "did it"},
+                      {"role": "user", "content": "ALPHA: keep going"}]
+        b2 = bravo + [{"role": "assistant", "content": "did it"},
+                      {"role": "user", "content": "BRAVO: keep going"}]
+        post(proxy_port, a2, sid="session-alpha")
+        post(proxy_port, b2, sid="session-bravo")
+        time.sleep(1)
+    finally:
+        proxy.terminate()
+        mock.terminate()
+
+    reqs = [json.loads(l)["detail"] for l in open(log, encoding="utf-8")
+            if json.loads(l)["kind"] == "request"]
+    chats = [r for r in reqs if not r["compaction"]]
+
+    # Count compactions that started BEFORE the second turns were sent. Counting
+    # all of them is too weak: the blocked conversation does eventually compact
+    # once the other finishes, just far too late to help the turn that needed it.
+    second_turn_start = len(reqs) - 1
+    seen_chats = 0
+    for i in range(len(reqs) - 1, -1, -1):
+        if not reqs[i]["compaction"]:
+            seen_chats += 1
+            if seen_chats == 2:
+                second_turn_start = i
+                break
+    early = [r for r in reqs[:second_turn_start] if r["compaction"]]
+
+    failures = check(failures, "both conversations compacted concurrently",
+                     len(early) >= 2,
+                     f"only {len(early)} compaction(s) started while the other was "
+                     f"running — one conversation was blocked by the other")
+    # The last two chats are the second turns; both must carry the summary.
+    tail = chats[-2:]
+    failures = check(failures, "both second turns carry a summary",
+                     len(tail) == 2 and all(c["carries_summary"] for c in tail),
+                     f"carries_summary={[c['carries_summary'] for c in tail]}")
+    return failures
+
+
 def main():
     root = tempfile.mkdtemp(prefix="rolling-context-test-")
     try:
@@ -482,6 +585,8 @@ def main():
         failures += script_encoding_cases()
         print("\nlog volume and rotation")
         failures += logging_cases(root)
+        print("\nconcurrent conversations")
+        failures += concurrency_case(root)
         print("\nlive proxy against a mock endpoint")
         failures += live_case(root, strict=False)
         failures += live_case(root, strict=True)
