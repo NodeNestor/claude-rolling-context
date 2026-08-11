@@ -18,6 +18,7 @@ import os
 from collections import OrderedDict
 import sys
 import logging
+import logging.handlers
 import threading
 import time
 import ssl
@@ -29,22 +30,56 @@ import endpoints
 import switch
 from compressor import RollingCompressor
 
-class FlushFileHandler(logging.FileHandler):
+class FlushRotatingHandler(logging.handlers.RotatingFileHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
 
+
+def _log_setting(name, default):
+    """Env first, then settings.json — same precedence as every other knob."""
+    return os.environ.get(name) or endpoints.settings_env().get(name) or default
+
+
+# Was hardcoded DEBUG with an unrotated FileHandler, while start-proxy.sh
+# redirected stdout into a second file. Every line landed on disk twice and
+# nothing ever pruned either one; a reporter hit 5.9 GB in rolling-context-proxy.log
+# on a proxy left up for days (issue #7).
+_LEVEL = getattr(logging, str(_log_setting("ROLLING_CONTEXT_LOG_LEVEL", "INFO")).upper(),
+                 logging.INFO)
+try:
+    _MAX_MB = max(1, int(_log_setting("ROLLING_CONTEXT_LOG_MAX_MB", "10")))
+except (TypeError, ValueError):
+    _MAX_MB = 10
+try:
+    _BACKUPS = max(0, int(_log_setting("ROLLING_CONTEXT_LOG_BACKUPS", "3")))
+except (TypeError, ValueError):
+    _BACKUPS = 3
+
 _log_path = os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-debug.log")
 # encoding is explicit: without it Windows falls back to cp1252 and the em
 # dashes in these log messages land as mojibake.
-_log_handler = FlushFileHandler(_log_path, mode="a", encoding="utf-8")
-_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), _log_handler],
+_log_handler = FlushRotatingHandler(
+    _log_path, mode="a", encoding="utf-8",
+    maxBytes=_MAX_MB * 1024 * 1024, backupCount=_BACKUPS,
 )
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log_handler.setLevel(_LEVEL)
+
+# stdout is redirected to rolling-context-proxy.log by the start hook, which
+# only truncates on restart — so it must not carry routine traffic or a
+# long-lived proxy grows without bound. WARNING and above keeps crashes and
+# real problems visible there without duplicating the whole stream.
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_stream_handler.setLevel(max(_LEVEL, logging.WARNING))
+
+logging.basicConfig(level=_LEVEL, handlers=[_stream_handler, _log_handler])
 log = logging.getLogger("rolling-context")
+log.info(
+    f"Logging at {logging.getLevelName(_LEVEL)}; {_log_path} rotates at "
+    f"{_MAX_MB} MB x {_BACKUPS}. Set ROLLING_CONTEXT_LOG_LEVEL=DEBUG for detail."
+)
 
 LISTEN_PORT = endpoints.LISTEN_PORT
 
@@ -297,13 +332,19 @@ class CompressionStore:
                             best_end = end
                         found = True
                         break
-                if not found and chain_len <= len(msg_hashes):
-                    # Count total mismatches
+                # DEBUG, not WARNING: a scan miss is the ordinary case, emitted
+                # per stored entry per request, and it dumps conversation
+                # content to disk. At WARNING it was the single largest
+                # contributor to a 5.9 GB log (issue #7) — 56,960 lines against
+                # 53 real injections. The isEnabledFor guard means the diff is
+                # not even computed unless someone asked for DEBUG.
+                if (not found and chain_len <= len(msg_hashes)
+                        and log.isEnabledFor(logging.DEBUG)):
                     mismatches = []
                     for i in range(min(chain_len, len(msg_hashes))):
                         if oh[i] != msg_hashes[i]:
                             mismatches.append(i)
-                    log.warning(
+                    log.debug(
                         f"[MATCH] No match: chain={chain_len} req={len(msg_hashes)} "
                         f"mismatches={len(mismatches)} at positions: "
                         f"{mismatches[:10]}{'...' if len(mismatches) > 10 else ''}"
@@ -316,7 +357,7 @@ class CompressionStore:
                         if stored_msg and incoming_msg:
                             s_content = str(stored_msg.get("content", ""))[:500]
                             i_content = str(incoming_msg.get("content", ""))[:500]
-                            log.warning(
+                            log.debug(
                                 f"[MATCH] Mismatch at [{idx}] role={stored_msg.get('role')}:\n"
                                 f"  STORED:   {s_content}\n"
                                 f"  INCOMING: {i_content}"

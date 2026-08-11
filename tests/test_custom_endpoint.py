@@ -66,9 +66,9 @@ def fake_home(root, settings_env, bom=False):
 
 def clean_env(home, **extra):
     env = dict(os.environ)
-    for k in ("ROLLING_CONTEXT_UPSTREAM", "ROLLING_CONTEXT_SUMMARIZER_URL",
-              "ROLLING_CONTEXT_SUMMARIZER_KEY", "ROLLING_CONTEXT_SUMMARIZER_FORMAT",
-              "ROLLING_CONTEXT_MODEL", "ROLLING_CONTEXT_PORT"):
+    # Strip every ROLLING_CONTEXT_* var, not a hand-listed subset: a knob added
+    # later would otherwise leak the developer's own shell into the test.
+    for k in [k for k in env if k.startswith("ROLLING_CONTEXT_")]:
         env.pop(k, None)
     env.update(HOME=home, USERPROFILE=home)
     env.update(extra)
@@ -402,6 +402,75 @@ def script_encoding_cases():
     return failures
 
 
+# ---------------------------------------------------------------- part E ----
+# Issue #7: the proxy logged at DEBUG unconditionally into an unrotated file,
+# while the start hook redirected stdout into a second one. Every line hit disk
+# twice and nothing ever pruned either — 5.9 GB of rolling-context-proxy.log on
+# a proxy left up for days.
+
+LOG_PROBE = (
+    "import json, logging, server;"
+    "hs=logging.getLogger().handlers;"
+    "r=[x for x in hs if hasattr(x,'maxBytes')];"
+    "s=[x for x in hs if not hasattr(x,'maxBytes')];"
+    "print('PROBE'+json.dumps({'rotating': bool(r),"
+    "'file_level': logging.getLevelName(r[0].level) if r else None,"
+    "'max_bytes': r[0].maxBytes if r else 0,"
+    "'backups': r[0].backupCount if r else 0,"
+    "'stream_level': logging.getLevelName(s[0].level) if s else None}))"
+)
+
+ROTATE_PROBE = (
+    "import os, server;"
+    "[server.log.info('x'*200) for _ in range(40000)];"
+    "d=os.path.join(os.path.expanduser('~'), '.claude');"
+    "print('PROBE'+str(sum(os.path.getsize(os.path.join(d,f))"
+    " for f in os.listdir(d) if 'debug.log' in f)))"
+)
+
+
+def probe(root, tag, code, **env):
+    home = fake_home(os.path.join(root, tag), {})
+    out = subprocess.run([sys.executable, "-c", code], cwd=PROXY,
+                         env=clean_env(home, **env), capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    for line in out.stdout.splitlines():
+        if line.startswith("PROBE"):
+            return line[5:]
+    raise AssertionError(f"probe produced no output: {out.stdout[:300]} {out.stderr[:300]}")
+
+
+def logging_cases(root):
+    failures = 0
+
+    cfg = json.loads(probe(root, "log-default", LOG_PROBE))
+    failures = check(failures, "debug log rotates", cfg["rotating"],
+                     "no RotatingFileHandler — the log grows without bound")
+    failures = check(failures, "defaults to INFO, not DEBUG",
+                     cfg["file_level"] == "INFO", f"got {cfg['file_level']}")
+    failures = check(failures, "rotation bound is sane",
+                     cfg["max_bytes"] > 0 and cfg["backups"] > 0,
+                     f"maxBytes={cfg['max_bytes']} backups={cfg['backups']}")
+    # stdout is redirected into rolling-context-proxy.log, which the start hook
+    # only truncates on restart. Routine traffic must not go there.
+    failures = check(failures, "stdout carries WARNING and above only",
+                     cfg["stream_level"] == "WARNING", f"got {cfg['stream_level']}")
+
+    dbg = json.loads(probe(root, "log-debug", LOG_PROBE,
+                           ROLLING_CONTEXT_LOG_LEVEL="DEBUG"))
+    failures = check(failures, "ROLLING_CONTEXT_LOG_LEVEL raises the level",
+                     dbg["file_level"] == "DEBUG", f"got {dbg['file_level']}")
+
+    # The claim that matters: write far past the cap, disk stays bounded.
+    total = int(probe(root, "log-rotate", ROTATE_PROBE,
+                      ROLLING_CONTEXT_LOG_MAX_MB="1", ROLLING_CONTEXT_LOG_BACKUPS="2"))
+    cap = 3 * 1024 * 1024 + 65536  # (1 active + 2 backups) x 1 MB, plus slack
+    failures = check(failures, "8 MB of log lines stay bounded on disk", total <= cap,
+                     f"{total:,} bytes on disk, expected <= {cap:,}")
+    print(f"            ({total:,} bytes on disk from ~8,000,000 bytes written)")
+    return failures
+
+
 def main():
     root = tempfile.mkdtemp(prefix="rolling-context-test-")
     try:
@@ -411,6 +480,8 @@ def main():
         failures += preservation_cases(root)
         print("\nshipped script encoding")
         failures += script_encoding_cases()
+        print("\nlog volume and rotation")
+        failures += logging_cases(root)
         print("\nlive proxy against a mock endpoint")
         failures += live_case(root, strict=False)
         failures += live_case(root, strict=True)

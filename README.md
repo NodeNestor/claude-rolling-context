@@ -285,6 +285,28 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
 | `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/rolling-context:on --global` |
 | `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag lives |
+| `ROLLING_CONTEXT_LOG_LEVEL` | `INFO` | `DEBUG` for per-request match detail (verbose, and it writes conversation content to disk) |
+| `ROLLING_CONTEXT_LOG_MAX_MB` | `10` | Rotate `rolling-context-debug.log` at this size |
+| `ROLLING_CONTEXT_LOG_BACKUPS` | `3` | Rotated files kept, so the log is capped at `(1 + backups) x max_mb` |
+
+### Logs
+
+Two files live in `~/.claude`:
+
+- `rolling-context-debug.log` — the proxy's own log, rotated and capped by the
+  settings above (30 MB total by default).
+- `rolling-context-proxy.log` — the proxy's stdout, captured by the start hook.
+  It carries `WARNING` and above only, so it stays small; it exists to catch
+  crashes that never reach the logger.
+
+Before v1.11.3 the proxy logged at `DEBUG` unconditionally into an unrotated
+file *and* duplicated every line into the second one. A long-lived proxy could
+reach several gigabytes (issue #7). If you are upgrading, delete the old files
+once — nothing prunes them retroactively:
+
+```bash
+rm -f ~/.claude/rolling-context-proxy.log ~/.claude/rolling-context-debug.log
+```
 
 ## Proxy Chaining
 
