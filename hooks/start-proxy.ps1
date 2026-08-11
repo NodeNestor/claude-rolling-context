@@ -19,6 +19,21 @@ function Log($msg) {
     Add-Content -Path $HookLog -Value "[$ts] $msg"
 }
 
+function Test-PointsAtUs($url, $port) {
+    # True only if url is OUR proxy: loopback AND our port. The old regex
+    # "127\.0\.0\.1.*$Port" matched 127.0.0.1:15588 for port 5588, and missed
+    # localhost:5588 entirely — which would have chained the proxy to itself.
+    # Matching on host alone (as the sh hook did) treats every local model
+    # endpoint as the proxy and skips chaining altogether.
+    try {
+        $full = if ($url -match '://') { $url } else { "http://$url" }
+        $u = [System.Uri]$full
+        return (@('127.0.0.1', 'localhost', '::1') -contains $u.Host) -and ($u.Port -eq [int]$port)
+    } catch {
+        return $false
+    }
+}
+
 Log "Hook started. ProxyDir=$ProxyDir"
 
 # Always update settings.json first (even if proxy is already running)
@@ -43,7 +58,7 @@ try {
     if (-not $existingUrl) {
         $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
         Log "Set ANTHROPIC_BASE_URL=$ProxyUrl (settings.json)"
-    } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
+    } elseif (-not (Test-PointsAtUs $existingUrl $Port)) {
         # Save existing URL as upstream
         $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
         $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force

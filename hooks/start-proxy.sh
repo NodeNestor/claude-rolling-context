@@ -38,6 +38,7 @@ update_settings() {
 
     $py_cmd - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
 import json, sys, os
+from urllib.parse import urlparse
 
 settings_file = sys.argv[1]
 proxy_url = sys.argv[2]
@@ -70,11 +71,29 @@ if "env" not in settings or not isinstance(settings["env"], dict):
 env = settings["env"]
 
 # Set ANTHROPIC_BASE_URL
+def points_at_us(url):
+    """True only if url is OUR proxy — loopback AND our port.
+
+    Testing for the bare string "127.0.0.1" treated every LOCAL MODEL endpoint
+    as if it were the proxy already installed: Ollama on 11434, llama.cpp,
+    LM Studio on 1234, vLLM on 8000. Chaining was then skipped, so the plugin
+    sat there doing nothing for exactly the users the README tells to run local
+    models. The port is what distinguishes us; the host alone does not.
+    """
+    try:
+        u = urlparse(url if "://" in url else "http://" + url)
+        ours = urlparse(proxy_url)
+        return (u.hostname in ("127.0.0.1", "localhost", "::1")
+                and (u.port or 80) == (ours.port or 80))
+    except Exception:
+        return False
+
+
 existing = env.get("ANTHROPIC_BASE_URL", "")
 if not existing:
     env["ANTHROPIC_BASE_URL"] = proxy_url
     print("set")
-elif "127.0.0.1" not in existing:
+elif not points_at_us(existing):
     env["ROLLING_CONTEXT_UPSTREAM"] = existing
     env["ANTHROPIC_BASE_URL"] = proxy_url
     print("chained")

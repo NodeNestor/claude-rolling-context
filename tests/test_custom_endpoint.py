@@ -16,6 +16,7 @@ Two halves, no framework needed:
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -318,6 +319,57 @@ def chaining_case(root, script_rel, tag, corrupt_exit):
     return failures
 
 
+LOCAL_ENDPOINTS = [
+    # (label, existing ANTHROPIC_BASE_URL, must the hook chain it?)
+    ("llama.cpp on 18080",   "http://127.0.0.1:18080", True),
+    ("Ollama on 11434",      "http://127.0.0.1:11434", True),
+    ("LM Studio on 1234",    "http://localhost:1234",  True),
+    ("vLLM on 8000",         "http://127.0.0.1:8000",  True),
+    ("a remote endpoint",    CUSTOM,                   True),
+    # …but our own proxy must NOT be chained to itself, under either name.
+    ("the proxy itself",     "http://127.0.0.1:5588",  False),
+    ("the proxy as localhost", "http://localhost:5588", False),
+]
+
+
+def local_endpoint_case(root, script_rel, tag):
+    """A local model endpoint must be chained, not mistaken for the proxy.
+
+    The sh hook tested `"127.0.0.1" not in existing`, with no port check, so
+    ANY loopback endpoint looked like the proxy was already installed and
+    chaining was skipped — the plugin then sat inert for exactly the users the
+    README tells to run local models (Ollama, llama.cpp, LM Studio, vLLM).
+    Found by running Claude Code against a real llama.cpp server in a container:
+    the proxy was up, and not one request went through it.
+    """
+    print(f"  {script_rel}: local endpoints")
+    failures = 0
+    for label, url, should_chain in LOCAL_ENDPOINTS:
+        work = os.path.join(root, "local", tag, re.sub(r"\W+", "_", label))
+        os.makedirs(work, exist_ok=True)
+        settings_file = os.path.join(work, "settings.json")
+        with open(settings_file, "w", encoding="utf-8") as f:
+            json.dump({"env": {"ANTHROPIC_BASE_URL": url}}, f, indent=2)
+
+        subprocess.run([sys.executable, heredoc_python(work, script_rel, tag),
+                        settings_file, "http://127.0.0.1:5588"],
+                       capture_output=True, text=True)
+        env = json.load(open(settings_file, encoding="utf-8-sig")).get("env", {})
+        upstream = env.get("ROLLING_CONTEXT_UPSTREAM")
+        base = env.get("ANTHROPIC_BASE_URL")
+
+        if should_chain:
+            ok = upstream == url and base == "http://127.0.0.1:5588"
+            detail = (f"upstream={upstream!r} base={base!r} — traffic bypasses "
+                      f"the proxy entirely")
+        else:
+            ok = upstream is None and base == url
+            detail = f"upstream={upstream!r} — the proxy was chained to itself"
+        failures = check(failures, f"{label}: {'chained' if should_chain else 'left alone'}",
+                         ok, detail)
+    return failures
+
+
 def uninstall_case(root):
     """uninstall.sh must restore the real endpoint, BOM or not.
 
@@ -361,6 +413,8 @@ def uninstall_case(root):
 def preservation_cases(root):
     failures = chaining_case(root, "hooks/start-proxy.sh", "hook", 0)
     failures += chaining_case(root, "install.sh", "install", 1)
+    failures += local_endpoint_case(root, "hooks/start-proxy.sh", "hook")
+    failures += local_endpoint_case(root, "install.sh", "install")
     failures += uninstall_case(root)
     return failures
 

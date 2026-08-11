@@ -39,6 +39,7 @@ fi
 
 $PY_CMD - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
 import json, sys, os
+from urllib.parse import urlparse
 
 settings_file = sys.argv[1]
 proxy_url = sys.argv[2]
@@ -65,11 +66,27 @@ if "env" not in settings or not isinstance(settings["env"], dict):
 
 env = settings["env"]
 
+def points_at_us(url):
+    """True only if url is OUR proxy — loopback AND our port.
+
+    Matching the bare string "127.0.0.1" treated every local model endpoint
+    (Ollama 11434, llama.cpp, LM Studio 1234, vLLM 8000) as the proxy already
+    being installed, so chaining was skipped and the plugin did nothing.
+    """
+    try:
+        u = urlparse(url if "://" in url else "http://" + url)
+        ours = urlparse(proxy_url)
+        return (u.hostname in ("127.0.0.1", "localhost", "::1")
+                and (u.port or 80) == (ours.port or 80))
+    except Exception:
+        return False
+
+
 existing = env.get("ANTHROPIC_BASE_URL", "")
 if not existing:
     env["ANTHROPIC_BASE_URL"] = proxy_url
     print(f"  Set ANTHROPIC_BASE_URL={proxy_url}")
-elif "127.0.0.1" not in existing:
+elif not points_at_us(existing):
     env["ROLLING_CONTEXT_UPSTREAM"] = existing
     env["ANTHROPIC_BASE_URL"] = proxy_url
     print(f"  Chaining: ANTHROPIC_BASE_URL={proxy_url} -> upstream={existing}")
