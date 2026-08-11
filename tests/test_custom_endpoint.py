@@ -20,6 +20,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import urllib.request
@@ -574,6 +575,75 @@ def concurrency_case(root):
     return failures
 
 
+def subagent_case(root):
+    """A parent and its subagents share ONE session id (server.py:204).
+
+    Subagents get their own transcript, not their own session. Keying
+    concurrency on the session id alone therefore collapses an entire agent team
+    into a single conversation and they block each other — #8 again, scoped to
+    the team. Measured before the fix: 2 compactions instead of 3, and neither
+    subagent ever received a summary.
+    """
+    print("  one session id, parent + 2 subagents")
+    failures = 0
+    mock_port, proxy_port = free_port(), free_port()
+    work = os.path.join(root, "subagents")
+    os.makedirs(work, exist_ok=True)
+    log = os.path.join(work, "mock.jsonl")
+
+    home = fake_home(work, {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{proxy_port}",
+                            "ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{mock_port}"})
+    env = clean_env(home, ROLLING_CONTEXT_PORT=str(proxy_port),
+                    ROLLING_CONTEXT_TRIGGER="1000", ROLLING_CONTEXT_TARGET="400")
+    mock = subprocess.Popen(
+        [sys.executable, MOCK, str(mock_port), log],
+        env=dict(os.environ, MOCK_COMPACTION_DELAY="4", MOCK_TOKENS_FROM_SIZE="1"))
+    proxy = subprocess.Popen([sys.executable, "server.py"], cwd=PROXY, env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    SID = "shared-session-id-parent-and-subagents"
+    try:
+        assert wait_port(mock_port), "mock endpoint did not start"
+        assert wait_port(proxy_port), "proxy did not start"
+
+        convos = {
+            "PARENT": distinct_conversation("PARENT", "p"),
+            "SUB1": distinct_conversation("SUBAGENT-ONE", "q"),
+            "SUB2": distinct_conversation("SUBAGENT-TWO", "r"),
+        }
+        post(proxy_port, convos["PARENT"], sid=SID)
+        time.sleep(0.8)                      # parent's compaction is running
+        threads = [threading.Thread(target=post, args=(proxy_port, convos[t], SID))
+                   for t in ("SUB1", "SUB2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        time.sleep(9)                        # let all three finish
+
+        for tag, base in convos.items():
+            post(proxy_port, base + [{"role": "assistant", "content": "ok"},
+                                     {"role": "user", "content": f"{tag} next"}],
+                 sid=SID)
+        time.sleep(1)
+    finally:
+        proxy.terminate()
+        mock.terminate()
+
+    reqs = [json.loads(l)["detail"] for l in open(log, encoding="utf-8")
+            if json.loads(l)["kind"] == "request"]
+    compactions = [r for r in reqs if r["compaction"]]
+    tail = [r for r in reqs if not r["compaction"]][-3:]
+
+    failures = check(failures, "all three transcripts compacted",
+                     len(compactions) >= 3,
+                     f"only {len(compactions)} — the team shares one session id "
+                     f"and blocked itself")
+    failures = check(failures, "parent and both subagents carry a summary",
+                     len(tail) == 3 and all(c["carries_summary"] for c in tail),
+                     f"carries_summary={[c['carries_summary'] for c in tail]}")
+    return failures
+
+
 def main():
     root = tempfile.mkdtemp(prefix="rolling-context-test-")
     try:
@@ -587,6 +657,7 @@ def main():
         failures += logging_cases(root)
         print("\nconcurrent conversations")
         failures += concurrency_case(root)
+        failures += subagent_case(root)
         print("\nlive proxy against a mock endpoint")
         failures += live_case(root, strict=False)
         failures += live_case(root, strict=True)

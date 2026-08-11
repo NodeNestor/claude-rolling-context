@@ -459,14 +459,24 @@ def _conversation_key(session_id: str, msg_hashes: list) -> str:
     """Identify a conversation for concurrency accounting ONLY.
 
     Never used for matching — the store stays content-addressed, so this cannot
-    reintroduce session coupling. Claude Code sends X-Claude-Code-Session-Id;
-    when it is absent (older builds, other clients) the first message hash is
-    stable for the life of a conversation and is good enough to keep one
-    conversation from blocking another.
+    reintroduce session coupling.
+
+    The session id alone is NOT enough. A subagent inherits its parent's
+    X-Claude-Code-Session-Id (it gets its own transcript, not its own session),
+    so keying on the id would collapse a whole agent team into one conversation
+    and they would block each other — #8 again, scoped to the team. Measured
+    before this was fixed: a parent plus two subagents produced 2 compactions
+    instead of 3, and neither subagent ever received a summary.
+
+    The first message hash separates transcripts within a session, and is stable
+    for the life of a transcript because Claude Code always sends the full
+    history. The session id still scopes it, so two sessions that happen to open
+    with identical text stay distinct.
     """
+    head = msg_hashes[0] if msg_hashes else "empty"
     if session_id:
-        return "sid:" + session_id
-    return "msg:" + (msg_hashes[0] if msg_hashes else "empty")
+        return "sid:" + session_id + ":" + head
+    return "msg:" + head
 
 
 def _note_compression_failure(owner: str):
