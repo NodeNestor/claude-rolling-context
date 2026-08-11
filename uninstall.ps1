@@ -1,4 +1,4 @@
-# Uninstall the Rolling Context plugin (Windows)
+﻿# Uninstall the Rolling Context plugin (Windows)
 #
 # Run: powershell -ExecutionPolicy Bypass -File uninstall.ps1
 
@@ -66,7 +66,10 @@ if (Test-Path $InstalledFile) {
     $json = Get-Content $InstalledFile -Raw | ConvertFrom-Json
     if ($json.plugins.PSObject.Properties["rolling-context@rolling-context-marketplace"]) {
         $json.plugins.PSObject.Properties.Remove("rolling-context@rolling-context-marketplace")
-        $json | ConvertTo-Json -Depth 10 | Set-Content $InstalledFile
+        # Bare Set-Content defaults to ANSI on Windows PowerShell 5.1, which
+        # mangles any non-ASCII path in Claude Code's own plugin registry, and
+        # -Encoding UTF8 would add a BOM. Write BOM-less UTF-8 explicitly.
+        [System.IO.File]::WriteAllText($InstalledFile, ($json | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding $false))
         Write-Host "Removed from installed plugins"
     }
 }
@@ -77,7 +80,7 @@ if (Test-Path $MarketplacesFile) {
     $json = Get-Content $MarketplacesFile -Raw | ConvertFrom-Json
     if ($json.PSObject.Properties["rolling-context-marketplace"]) {
         $json.PSObject.Properties.Remove("rolling-context-marketplace")
-        $json | ConvertTo-Json -Depth 10 | Set-Content $MarketplacesFile
+        [System.IO.File]::WriteAllText($MarketplacesFile, ($json | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding $false))
         Write-Host "Removed marketplace"
     }
 }
@@ -117,7 +120,7 @@ if (Test-Path $SettingsFile) {
                 $settings.env.PSObject.Properties.Remove($key)
             }
 
-            $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+            [System.IO.File]::WriteAllText($SettingsFile, ($settings | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding $false))
         }
     } catch {
         Write-Host "WARNING: Could not clean settings.json: $_"

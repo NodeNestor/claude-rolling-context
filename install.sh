@@ -46,10 +46,19 @@ proxy_url = sys.argv[2]
 settings = {}
 if os.path.exists(settings_file):
     try:
-        with open(settings_file, "r") as f:
+        # utf-8-sig: a BOM must not read as corruption. See hooks/start-proxy.sh.
+        with open(settings_file, "r", encoding="utf-8-sig") as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        settings = {}
+    except (json.JSONDecodeError, IOError, OSError, UnicodeDecodeError):
+        # Refuse to write: regenerating the file from {} would destroy the
+        # user's entire global config. Fail the install instead.
+        print("  ERROR: settings.json exists but could not be parsed — left untouched.")
+        print("  Fix or move that file, then re-run this installer.")
+        sys.exit(1)
+
+if not isinstance(settings, dict):
+    print("  ERROR: settings.json is not a JSON object — left untouched.")
+    sys.exit(1)
 
 if "env" not in settings or not isinstance(settings["env"], dict):
     settings["env"] = {}
@@ -82,7 +91,7 @@ for key, value in defaults.items():
 if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
     del env["ROLLING_CONTEXT_MODEL"]
 
-with open(settings_file, "w") as f:
+with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 

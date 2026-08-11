@@ -1,4 +1,4 @@
-# Ensure rolling context proxy is running (Windows)
+﻿# Ensure rolling context proxy is running (Windows)
 # Pure stdlib — no venv needed, just python
 
 $ErrorActionPreference = "SilentlyContinue"

@@ -240,81 +240,165 @@ REAL_CONFIG = {
 }
 
 
-def hook_python(tmpdir):
-    """Extract the settings-updating python out of hooks/start-proxy.sh.
+def heredoc_python(tmpdir, script_rel, tag):
+    """Extract the settings-updating python out of a shipped shell script.
 
-    Deliberately reads the shipped hook rather than a copy: if the heredoc
+    Deliberately reads the shipped artefact rather than a copy: if the heredoc
     changes, this test changes with it.
     """
-    sh = os.path.join(HERE, "..", "hooks", "start-proxy.sh")
+    sh = os.path.join(HERE, "..", *script_rel.split("/"))
     with open(sh, encoding="utf-8") as f:
         body = f.read()
     block = body.split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
-    path = os.path.join(tmpdir, "hookblock.py")
+    path = os.path.join(tmpdir, f"block_{tag}.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(block)
     return path
 
 
-def preservation_cases(root):
-    cases = [
-        ("BOM-less config", "plain", True),
-        # PowerShell 5.1 wrote this; git-bash shares $HOME, so the sh hook read
-        # it, called it corrupt, and rewrote the file from scratch.
-        ("BOM'd config (PowerShell-written)", "bom", True),
-        # Genuinely unparseable: chaining must be skipped, file left untouched.
-        ("truly corrupt config", "corrupt", False),
-    ]
+def write_config(path, mode):
+    if mode == "corrupt":
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ this is not json at all")
+    else:
+        with open(path, "w", encoding="utf-8-sig" if mode == "bom" else "utf-8") as f:
+            json.dump(REAL_CONFIG, f, indent=2)
 
+
+def check(failures, label, ok, detail=""):
+    print(("    PASS  " if ok else "    FAIL  ") + label)
+    if not ok and detail:
+        print(f"            {detail}")
+    return failures + (not ok)
+
+
+def chaining_case(root, script_rel, tag, corrupt_exit):
+    """start-proxy.sh and install.sh: chain the upstream, never destroy config."""
+    print(f"  {script_rel}")
     failures = 0
-    for label, mode, should_chain in cases:
-        work = os.path.join(root, "preserve", mode)
+    for label, mode in (("BOM-less config", "plain"),
+                        # PowerShell 5.1 wrote this; git-bash shares $HOME, so
+                        # the sh hook read it, called it corrupt, and rewrote
+                        # the file from scratch.
+                        ("BOM'd config (PowerShell-written)", "bom"),
+                        ("truly corrupt config", "corrupt")):
+        work = os.path.join(root, "preserve", tag, mode)
         os.makedirs(work, exist_ok=True)
         settings_file = os.path.join(work, "settings.json")
-
-        if mode == "corrupt":
-            raw = "{ this is not json at all"
-            with open(settings_file, "w", encoding="utf-8") as f:
-                f.write(raw)
-        else:
-            enc = "utf-8-sig" if mode == "bom" else "utf-8"
-            with open(settings_file, "w", encoding=enc) as f:
-                json.dump(REAL_CONFIG, f, indent=2)
+        write_config(settings_file, mode)
 
         before = open(settings_file, "rb").read()
-        subprocess.run([sys.executable, hook_python(work), settings_file,
-                        "http://127.0.0.1:5588"], capture_output=True, text=True)
+        proc = subprocess.run(
+            [sys.executable, heredoc_python(work, script_rel, tag), settings_file,
+             "http://127.0.0.1:5588"], capture_output=True, text=True)
         after_bytes = open(settings_file, "rb").read()
 
         if mode == "corrupt":
-            ok = after_bytes == before
-            print(("  PASS  " if ok else "  FAIL  ")
-                  + f"{label}: left byte-for-byte untouched")
-            if not ok:
-                print(f"          file was rewritten: {after_bytes[:80]!r}")
-            failures += not ok
+            failures = check(failures, f"{label}: left byte-for-byte untouched",
+                             after_bytes == before,
+                             f"file was rewritten: {after_bytes[:80]!r}")
+            failures = check(failures, f"{label}: exits {corrupt_exit}",
+                             proc.returncode == corrupt_exit,
+                             f"got {proc.returncode}")
             continue
 
         after = json.loads(after_bytes.decode("utf-8-sig"))
         lost = [k for k in REAL_CONFIG if k not in after]
-        ok = not lost
-        print(("  PASS  " if ok else "  FAIL  ") + f"{label}: user config survives")
-        if lost:
-            print(f"          DESTROYED top-level keys: {lost}")
-        failures += not ok
-
+        failures = check(failures, f"{label}: user config survives", not lost,
+                         f"DESTROYED top-level keys: {lost}")
         chained = after.get("env", {}).get("ROLLING_CONTEXT_UPSTREAM")
-        ok2 = (chained == CUSTOM) if should_chain else (chained is None)
-        print(("  PASS  " if ok2 else "  FAIL  ") + f"{label}: custom upstream chained")
-        if not ok2:
-            print(f"          want {CUSTOM if should_chain else None!r}, got {chained!r}")
-        failures += not ok2
+        failures = check(failures, f"{label}: custom upstream chained",
+                         chained == CUSTOM, f"want {CUSTOM!r}, got {chained!r}")
+        failures = check(failures, f"{label}: written without a BOM",
+                         not after_bytes.startswith(b"\xef\xbb\xbf"))
+    return failures
 
-        # The hook must not reintroduce the BOM that started all this.
-        ok3 = not after_bytes.startswith(b"\xef\xbb\xbf")
-        print(("  PASS  " if ok3 else "  FAIL  ") + f"{label}: written without a BOM")
-        failures += not ok3
 
+def uninstall_case(root):
+    """uninstall.sh must restore the real endpoint, BOM or not.
+
+    On a BOM'd config this used to parse-fail and exit silently, leaving
+    ANTHROPIC_BASE_URL pointed at a proxy that no longer exists — which breaks
+    Claude Code outright.
+    """
+    print("  uninstall.sh")
+    failures = 0
+    for label, mode in (("BOM-less config", "plain"),
+                        ("BOM'd config (PowerShell-written)", "bom")):
+        work = os.path.join(root, "preserve", "uninstall", mode)
+        os.makedirs(work, exist_ok=True)
+        settings_file = os.path.join(work, "settings.json")
+        # State the plugin leaves behind while installed.
+        cfg = json.loads(json.dumps(REAL_CONFIG))
+        cfg["env"] = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5588",
+                      "ROLLING_CONTEXT_UPSTREAM": CUSTOM,
+                      "ROLLING_CONTEXT_TRIGGER": "100000"}
+        with open(settings_file, "w", encoding="utf-8-sig" if mode == "bom" else "utf-8") as f:
+            json.dump(cfg, f, indent=2)
+
+        subprocess.run([sys.executable, heredoc_python(work, "uninstall.sh", "uninstall"),
+                        settings_file], capture_output=True, text=True)
+        after_bytes = open(settings_file, "rb").read()
+        after = json.loads(after_bytes.decode("utf-8-sig"))
+        env = after.get("env", {})
+
+        failures = check(failures, f"{label}: real endpoint restored",
+                         env.get("ANTHROPIC_BASE_URL") == CUSTOM,
+                         f"want {CUSTOM!r}, got {env.get('ANTHROPIC_BASE_URL')!r} "
+                         f"— Claude Code left pointing at a dead proxy")
+        failures = check(failures, f"{label}: plugin vars removed",
+                         not [k for k in env if k.startswith("ROLLING_CONTEXT_")],
+                         f"left behind: {[k for k in env if k.startswith('ROLLING_CONTEXT_')]}")
+        failures = check(failures, f"{label}: user config survives",
+                         not [k for k in REAL_CONFIG if k not in after])
+    return failures
+
+
+def preservation_cases(root):
+    failures = chaining_case(root, "hooks/start-proxy.sh", "hook", 0)
+    failures += chaining_case(root, "install.sh", "install", 1)
+    failures += uninstall_case(root)
+    return failures
+
+
+# ---------------------------------------------------------------- part D ----
+
+def script_encoding_cases():
+    """Shipped .ps1 files must be ASCII-only or carry a UTF-8 BOM.
+
+    Windows PowerShell 5.1 reads a BOM-less script as ANSI, so a UTF-8 em dash
+    decodes to 'a-euro-"' — and that trailing character is U+201D, which
+    PowerShell accepts as a string delimiter. One em dash inside a double-quoted
+    string is therefore a parse error for the whole file; install.ps1 carried
+    exactly that and could not run on Windows at all.
+
+    Note the inversion that makes this easy to get backwards: a BOM on a
+    PowerShell *script* is required, while a BOM on the *settings.json* it
+    writes is the bug fixed above. Different files, opposite rules.
+    """
+    failures = 0
+    root = os.path.join(HERE, "..")
+    scripts = []
+    for sub in (".", "hooks", "commands"):
+        d = os.path.join(root, sub)
+        if os.path.isdir(d):
+            scripts += [os.path.join(d, n) for n in sorted(os.listdir(d))
+                        if n.endswith(".ps1")]
+    if not scripts:
+        print("    FAIL  no .ps1 files found — test is not looking where it thinks")
+        return 1
+
+    for path in scripts:
+        raw = open(path, "rb").read()
+        bom = raw.startswith(b"\xef\xbb\xbf")
+        try:
+            (raw[3:] if bom else raw).decode("ascii")
+            ascii_only = True
+        except UnicodeDecodeError:
+            ascii_only = False
+        name = os.path.relpath(path, root).replace("\\", "/")
+        failures = check(failures, f"{name}: ASCII-only or BOM'd", bom or ascii_only,
+                         "non-ASCII without a BOM — PS 5.1 will read it as ANSI")
     return failures
 
 
@@ -325,6 +409,8 @@ def main():
         failures = resolution_cases(root)
         print("\nglobal settings.json preservation")
         failures += preservation_cases(root)
+        print("\nshipped script encoding")
+        failures += script_encoding_cases()
         print("\nlive proxy against a mock endpoint")
         failures += live_case(root, strict=False)
         failures += live_case(root, strict=True)
