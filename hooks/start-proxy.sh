@@ -22,21 +22,23 @@ else
     IS_WINDOWS=false
 fi
 
+_python() {
+    if [ "$IS_WINDOWS" = true ]; then
+        echo "python"
+    elif command -v python3 &>/dev/null; then
+        echo "python3"
+    else
+        echo "python"
+    fi
+}
+PYTHON_CMD=$(_python)
+
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
 # Always update settings.json first (even if proxy is already running)
 SETTINGS_FILE="$HOME/.claude/settings.json"
 update_settings() {
-    local py_cmd=""
-    if [ "$IS_WINDOWS" = true ]; then
-        py_cmd="python"
-    elif command -v python3 &>/dev/null; then
-        py_cmd="python3"
-    else
-        py_cmd="python"
-    fi
-
-    $py_cmd - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
+    $PYTHON_CMD - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
 import json, sys, os
 from urllib.parse import urlparse
 
@@ -152,37 +154,126 @@ _pid_alive() {
     fi
 }
 
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if _pid_alive "$PID"; then
-        # Check if version changed — restart if so
-        RUNNING_VERSION=$(cat "$VERFILE" 2>/dev/null)
-        if [ "$CURRENT_VERSION" = "$RUNNING_VERSION" ]; then
-            log "Proxy already running (PID $PID, v$RUNNING_VERSION)"
-            exit 0
-        fi
-        log "Version changed ($RUNNING_VERSION -> $CURRENT_VERSION), restarting proxy (PID $PID)"
-        _kill_pid "$PID"
+_is_our_proxy() {
+    # Identity, not just liveness. `kill -0` answers "is SOME process wearing
+    # this number", and after a crash the kernel hands the dead proxy's number
+    # to whatever starts next. Killing on liveness alone would kill a stranger.
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    if [ "$IS_WINDOWS" = true ]; then
+        powershell.exe -NoProfile -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$pid\" -ErrorAction SilentlyContinue; if (\$p -and \$p.CommandLine -like '*server.py*') { exit 0 } else { exit 1 }" 2>/dev/null
+    elif [ -r "/proc/$pid/cmdline" ]; then
+        tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "server\.py"
+    else
+        ps -p "$pid" -o args= 2>/dev/null | grep -q "server\.py"
     fi
+}
+
+_stop_pid() {
+    local pid="$1" source="$2"
+    [ -n "$pid" ] || return 0
+    _pid_alive "$pid" || return 0
+    if _is_our_proxy "$pid"; then
+        log "Stopping proxy PID $pid ($source)"
+        _kill_pid "$pid"
+    else
+        log "PID $pid ($source) is alive but is not our proxy — recycled PID, leaving that process alone"
+    fi
+}
+
+_clear_recorded_proxy() {
+    # $1 = true when something is still serving on the port. The PID reported
+    # by /health outranks the PID file: it comes from the process that is
+    # actually holding the port, while the file is a copy that a crash, a lost
+    # bind race or a manual start can leave pointing anywhere.
+    if [ "$1" = "serving" ]; then
+        _stop_pid "$(_probe_pid)" "reported by /health"
+    fi
+    _stop_pid "$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]')" "from the PID file"
     rm -f "$PIDFILE" "$VERFILE"
-fi
+}
+
+_probe() {
+    $PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" "${1:-2}" 2>/dev/null
+}
+
+_probe_pid() {
+    $PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" "${1:-2}" pid 2>/dev/null | tr -d '[:space:]'
+}
+
+# Ask the PORT, not the PID file. The PID file only records an intention to
+# run; the port is where "running" is either true or it is not. See probe.py
+# and issue #9 for the failure this replaces.
+PROBE=$(_probe 2)
+case "$PROBE" in
+    "ours $CURRENT_VERSION")
+        log "Proxy already running and healthy on :$PORT (v$CURRENT_VERSION)"
+        exit 0
+        ;;
+    ours*)
+        log "Version changed (${PROBE#ours } -> $CURRENT_VERSION), restarting proxy"
+        _clear_recorded_proxy serving
+        # The old proxy owns the port until it actually exits. Starting on top
+        # of it would just lose the bind and leave the old version serving
+        # while the log claimed a restart.
+        # Bounded by the clock, not by a probe count: each probe costs an
+        # interpreter start, and the SessionStart hook has 30s in total.
+        SECONDS=0
+        while [ "$SECONDS" -lt 5 ]; do
+            case "$(_probe 0.5)" in ours*) ;; *) break ;; esac
+            sleep 0.25
+        done
+        case "$(_probe 0.5)" in
+            ours*)
+                log "ERROR: the old proxy is still serving on :$PORT and could not be stopped — not starting a second one."
+                exit 0
+                ;;
+        esac
+        ;;
+    foreign)
+        # Starting here would only fail to bind, silently, forever. Say so.
+        log "ERROR: port $PORT is held by something that is not this proxy — not starting. Free the port or set ROLLING_CONTEXT_PORT to another one."
+        exit 0
+        ;;
+    *)
+        [ -f "$PIDFILE" ] && log "PID file present but nothing is serving on :$PORT — the recorded proxy is gone; restarting"
+        _clear_recorded_proxy
+        ;;
+esac
 
 # Start proxy directly — no venv needed (pure stdlib)
+if [ ! -f "$PROXY_DIR/server.py" ]; then
+    log "ERROR: $PROXY_DIR/server.py not found — proxy not started"
+    exit 0
+fi
 log "Starting proxy..."
 (
-    cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 1; }
-    PYTHON_CMD=""
-    if [ "$IS_WINDOWS" = true ]; then
-        PYTHON_CMD="python"
-    elif command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    else
-        PYTHON_CMD="python"
-    fi
+    cd "$PROXY_DIR" || exit 1
     nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
-    echo $! > "$PIDFILE"
-    echo "$CURRENT_VERSION" > "$VERFILE"
-    log "Proxy started with PID $! (v$CURRENT_VERSION)"
-) &
+)
+
+# Confirm it came up, rather than assuming. A start that fails — port taken,
+# python missing, a syntax error in the proxy — used to be invisible: the hook
+# exited 0, the session was already pointed at this port, and the only symptom
+# was ConnectionRefused on every request, with nothing in this log to explain
+# it. Bounded at ~8s so a cold start never stalls the session for long.
+SECONDS=0
+while [ "$SECONDS" -lt 8 ]; do
+    case "$(_probe 0.5)" in
+        "ours $CURRENT_VERSION")
+            # Record the PID /health reports, not $! — under git-bash on
+            # Windows $! is an MSYS job number that Get-Process/Stop-Process
+            # know nothing about, and if two sessions started at once the
+            # process that actually won the bind may not be ours at all.
+            _pid=$(_probe_pid 0.5)
+            echo "$_pid" > "$PIDFILE"
+            echo "$CURRENT_VERSION" > "$VERFILE"
+            log "Proxy healthy on :$PORT (v$CURRENT_VERSION, PID $_pid)"
+            exit 0
+            ;;
+    esac
+    sleep 0.25
+done
+log "ERROR: proxy did not answer on :$PORT within ~8s of starting — see $HOME/.claude/rolling-context-proxy.log"
 
 exit 0

@@ -83,6 +83,27 @@ log.info(
 
 LISTEN_PORT = endpoints.LISTEN_PORT
 
+
+def _plugin_version() -> str:
+    """Our version, read from the plugin manifest next to this file.
+
+    Reported on /health so the start hook can tell "the proxy is serving" from
+    "the proxy is serving, but it is the version you just replaced" without
+    consulting a side file that a crash can leave lying about.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".claude-plugin", "plugin.json",
+    )
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return str(json.load(f).get("version") or "unknown")
+    except Exception:
+        return "unknown"
+
+
+VERSION = _plugin_version()
+
 UPSTREAM_URL = endpoints.load_upstream(LISTEN_PORT)
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
 TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
@@ -698,6 +719,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         from compressor import NATIVE_MODE, SUMMARIZER_FORMAT
         data = {
             "status": "ok",
+            # Identity, not decoration. The start hook decides whether to start
+            # a proxy by asking this port who is on it; "some server answered
+            # 200" is not the same answer as "our proxy answered". Anything
+            # else on the port (a stray dev server on 5588) must not read as
+            # us, or the hook would leave sessions pointed at it.
+            "service": "rolling-context",
+            "version": VERSION,
+            "pid": os.getpid(),
             "enabled": not switch.is_disabled(),
             "default_enabled": switch.config_default_enabled(),
             "trigger_tokens": TRIGGER_TOKENS,

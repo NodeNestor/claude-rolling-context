@@ -97,25 +97,85 @@ try {
     Log "WARNING: Could not update settings.json: $_"
 }
 
-# Check if proxy is already running
-if (Test-Path $PidFile) {
-    $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($savedPid) {
-        $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-        if ($proc) {
-            # Check if version changed — restart if so
-            $runningVersion = if (Test-Path $VerFile) { Get-Content $VerFile -ErrorAction SilentlyContinue } else { "" }
-            if ($runningVersion -eq $CurrentVersion) {
-                Log "Proxy already running (PID $savedPid, v$runningVersion)"
-                exit 0
-            }
-            Log "Version changed ($runningVersion -> $CurrentVersion), restarting proxy (PID $savedPid)"
-            Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-        }
+# --- Is the proxy actually SERVING? ------------------------------------------
+# Not "does a PID file exist", and not even "is that PID alive". A crashed
+# proxy leaves its PID file behind and the OS is free to hand that number to an
+# unrelated process, so the liveness check says yes while nothing is listening:
+# the hook logs "Proxy already running" and every session that follows fails
+# with ConnectionRefused (issue #9). Ask the port instead — probe.py answers
+# "ours <version>", "foreign" or "down".
+$Probe = Join-Path $ScriptDir "probe.py"
+
+# Timeouts are passed as strings on purpose: a double renders through the
+# current culture, so on a comma-decimal locale 0.5 reaches python as "0,5".
+function Get-ProxyState([string]$timeout = "2") {
+    try { (& python $Probe $Port $timeout | Select-Object -First 1) } catch { "down" }
+}
+function Get-ProxyPid([string]$timeout = "2") {
+    try { (& python $Probe $Port $timeout "pid" | Select-Object -First 1) } catch { "" }
+}
+
+function Test-IsOurProxy($processId) {
+    # Identity, not just liveness — never kill a process that merely inherited
+    # our old PID.
+    if (-not $processId) { return $false }
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+    return ($p -and $p.CommandLine -like "*server.py*")
+}
+
+function Stop-ProxyPid($processId, $source) {
+    if (-not $processId) { return }
+    if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { return }
+    if (Test-IsOurProxy $processId) {
+        Log "Stopping proxy PID $processId ($source)"
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    } else {
+        Log "PID $processId ($source) is alive but is not our proxy — recycled PID, leaving that process alone"
+    }
+}
+
+function Clear-RecordedProxy([switch]$Serving) {
+    # The PID from /health outranks the PID file: it comes from the process
+    # actually holding the port, while the file is a copy that a crash, a lost
+    # bind race or a manual start can leave pointing anywhere.
+    if ($Serving) { Stop-ProxyPid (Get-ProxyPid) "reported by /health" }
+    if (Test-Path $PidFile) {
+        $savedPid = (Get-Content $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($savedPid) { Stop-ProxyPid ([string]$savedPid).Trim() "from the PID file" }
     }
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
     Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
+}
+
+$state = Get-ProxyState 2
+if ($state -eq "ours $CurrentVersion") {
+    Log "Proxy already running and healthy on :$Port (v$CurrentVersion)"
+    exit 0
+} elseif ($state -like "ours *") {
+    Log "Version changed ($($state -replace '^ours ', '') -> $CurrentVersion), restarting proxy"
+    Clear-RecordedProxy -Serving
+    # The old proxy owns the port until it actually exits. Starting on top of
+    # it would just lose the bind and leave the old version serving while the
+    # log claimed a restart.
+    # Bounded by the clock, not by a probe count: each probe costs an
+    # interpreter start, and the SessionStart hook has 30s in total.
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline -and (Get-ProxyState "0.5") -like "ours *") {
+        Start-Sleep -Milliseconds 250
+    }
+    if ((Get-ProxyState "0.5") -like "ours *") {
+        Log "ERROR: the old proxy is still serving on :$Port and could not be stopped — not starting a second one."
+        exit 0
+    }
+} elseif ($state -eq "foreign") {
+    # Starting here would only fail to bind, silently, forever. Say so.
+    Log "ERROR: port $Port is held by something that is not this proxy — not starting. Free the port or set ROLLING_CONTEXT_PORT to another one."
+    exit 0
+} else {
+    if (Test-Path $PidFile) {
+        Log "PID file present but nothing is serving on :$Port — the recorded proxy is gone; restarting"
+    }
+    Clear-RecordedProxy
 }
 
 # Start proxy directly with system python — no venv needed
@@ -124,8 +184,28 @@ $proc = Start-Process -FilePath "python" -ArgumentList "server.py" `
     -WorkingDirectory $ProxyDir `
     -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
     -WindowStyle Hidden -PassThru
-$proc.Id | Out-File -FilePath $PidFile -NoNewline
-$CurrentVersion | Out-File -FilePath $VerFile -NoNewline
 Log "Proxy started with PID $($proc.Id) (v$CurrentVersion)"
+
+# Confirm it came up, rather than assuming. A start that fails — port taken,
+# python missing, a syntax error in the proxy — used to be invisible: the hook
+# exited 0, the session was already pointed at this port, and the only symptom
+# was ConnectionRefused on every request, with nothing in this log to explain
+# it. Bounded at ~8s so a cold start never stalls the session for long.
+$deadline = (Get-Date).AddSeconds(8)
+while ((Get-Date) -lt $deadline) {
+    if ((Get-ProxyState "0.5") -eq "ours $CurrentVersion") {
+        # Record the PID /health reports, not the one we spawned: if two
+        # sessions started at once, the process that actually won the bind may
+        # not be ours, and recording a PID that is already dead is what left
+        # the next upgrade unable to stop anything.
+        $livePid = Get-ProxyPid "0.5"
+        $livePid | Out-File -FilePath $PidFile -NoNewline
+        $CurrentVersion | Out-File -FilePath $VerFile -NoNewline
+        Log "Proxy healthy on :$Port (v$CurrentVersion, PID $livePid)"
+        exit 0
+    }
+    Start-Sleep -Milliseconds 250
+}
+Log "ERROR: proxy did not answer on :$Port within ~8s of starting — see $ProxyLog"
 
 exit 0

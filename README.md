@@ -352,7 +352,27 @@ export ROLLING_CONTEXT_UPSTREAM=http://localhost:8080  # your existing proxy
 curl http://127.0.0.1:5588/health
 ```
 
-Returns compression stats: how many compressions, tokens saved, etc.
+Returns who is on the port (`service`, `version`, `pid`) and compression stats:
+how many compressions, tokens saved, etc.
+
+This is also how the start hook decides whether to start anything. It does not
+trust the PID file: a crashed proxy leaves that file behind, and the OS is free
+to give its number to an unrelated process, so "the PID is alive" was answering
+yes while nothing was listening — the hook logged `Proxy already running` and
+every session failed with `ConnectionRefused` until someone deleted the file by
+hand (issue #9, reported by @drewdrewthis). Asking the port cannot go stale.
+
+**If sessions fail with `API Error: Connection refused`**, read
+`~/.claude/rolling-context-hook.log` — since v1.11.7 the hook waits for the
+proxy to answer before it exits, and says which of these happened:
+
+| Log line | What it means |
+| --- | --- |
+| `Proxy healthy on :5588` | Started and serving. |
+| `PID file present but nothing is serving` | The recorded proxy died; restarted automatically. |
+| `... is alive but is not our proxy — recycled PID` | Another process inherited the old PID. Left alone, proxy restarted. |
+| `port 5588 is held by something that is not this proxy` | Free that port, or set `ROLLING_CONTEXT_PORT`. |
+| `proxy did not answer on :5588 within ~8s` | It failed to start — see `~/.claude/rolling-context-proxy.log`. |
 
 ## Debug
 

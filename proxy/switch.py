@@ -65,6 +65,35 @@ def config_path():
     return os.path.join(flag_dir(), "config.json")
 
 
+def proxy_line():
+    """One line on whether the proxy is actually up.
+
+    "rolling-context: ON" used to be printed by a status command that had
+    never checked whether anything was listening — the same blind spot that
+    let a crashed proxy read as running (issue #9). On is only meaningful if
+    there is a proxy to be on.
+    """
+    import urllib.request
+
+    port = os.environ.get("ROLLING_CONTEXT_PORT") or "5588"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        # ASCII only: this prints to a terminal that may be cp1252, where an
+        # em dash lands as a replacement character.
+        return (f"proxy: NOT RUNNING on port {port} - sessions will fail with "
+                f"connection refused.\n"
+                f"  It restarts on the next Claude Code session; see "
+                f"~/.claude/rolling-context-hook.log")
+    if body.get("service") != "rolling-context":
+        return f"proxy: port {port} is answering, but it is not this proxy"
+    return (f"proxy: running on port {port} (v{body.get('version', '?')}, "
+            f"{body.get('compression_count', 0)} compressions, "
+            f"{body.get('total_tokens_saved', 0):,} tokens saved)")
+
+
 def config_default_enabled():
     """The default for sessions that have not toggled themselves.
 
@@ -174,6 +203,7 @@ def main():
         # Never print the marker literals here — this output lands in the
         # transcript inside <local-command-stdout>, which is exactly what the
         # proxy scans, so a chatty status would toggle the session it reports on.
+        print(proxy_line())
         if env_disabled():
             print("rolling-context: OFF machine-wide (ROLLING_CONTEXT_DISABLE=1 in the environment)")
         elif os.path.exists(flag_path()):
