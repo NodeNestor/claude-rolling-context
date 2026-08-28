@@ -475,6 +475,18 @@ _failure_lock = threading.Lock()
 _stats = {"injected": 0, "missed": 0}
 _stats_lock = threading.Lock()
 
+# Cache-integrity sentinel. The design promises that between compactions every
+# request is append-only against what was actually SENT upstream last turn —
+# that is what makes the prompt cache hit. This verifies the promise instead of
+# assuming it: the one sanctioned prefix rewrite is a compaction injection;
+# any other divergence is a cache bust and gets flagged at WARNING.
+# Hashes are the normalized kind (_hash_message), so cache_control breakpoint
+# moves — which don't change tokens — don't false-alarm.
+_last_sent = {}                     # conversation key -> hashes of messages sent upstream
+_last_sent_lock = threading.Lock()
+_cache_stats = {"append_only": 0, "compaction_rewrites": 0,
+                "tail_divergences": 0, "busts": 0}
+
 
 def _conversation_key(session_id: str, msg_hashes: list) -> str:
     """Identify a conversation for concurrency accounting ONLY.
@@ -614,7 +626,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             total_bytes = 0
             while True:
-                chunk = resp.read(8192)
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -703,6 +715,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "last_injection_ts": _last_injection_ts,
             "stored_compressions": len(store.compressions),
             "enabled": not switch.is_disabled(),
+            "cache_integrity": dict(_cache_stats),
         }
         body = json.dumps(data).encode()
         self.send_response(200)
@@ -738,6 +751,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
             "active_compressions": active,
+            "cache_integrity": dict(_cache_stats),
         }
         body = json.dumps(data).encode()
         self.send_response(200)
@@ -882,6 +896,59 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Save current state for post-response compression trigger
         current_messages = payload.get("messages", messages)
 
+        # Cache-integrity sentinel: compare what we are about to send against
+        # what this conversation sent last turn. Keyed like concurrency
+        # accounting — on the ORIGINAL incoming head hash, which is stable for
+        # the life of a transcript even after injection rewrites the payload.
+        sent_hashes = msg_hashes if not injected else _hash_messages(current_messages)
+        convo_key = _conversation_key(session_id, msg_hashes)
+        cache_expectation = "first"
+        with _last_sent_lock:
+            prev_sent = _last_sent.get(convo_key)
+            if prev_sent is not None:
+                shorter = min(len(prev_sent), len(sent_hashes))
+                if prev_sent[:shorter] == sent_hashes[:shorter]:
+                    # Append-only (or a retry/rewind that is a pure prefix of
+                    # last turn) — the cached prefix is intact either way.
+                    cache_expectation = "hit"
+                    _cache_stats["append_only"] += 1
+                elif injected:
+                    cache_expectation = "rewrite"
+                    _cache_stats["compaction_rewrites"] += 1
+                    log.info(
+                        "[CACHE] prefix rewritten by compaction injection — "
+                        "one expected cache miss, re-caches next turn"
+                    )
+                else:
+                    div = next(
+                        (i for i in range(shorter)
+                         if prev_sent[i] != sent_hashes[i]),
+                        shorter,
+                    )
+                    if div >= len(prev_sent) - 2:
+                        # Only the tail changed — the cache still hits
+                        # everything before it. Headless --continue resumes
+                        # rewrite the final message this way; ordinary, cheap.
+                        cache_expectation = "tail"
+                        _cache_stats["tail_divergences"] += 1
+                        log.info(
+                            f"[CACHE] tail divergence at message "
+                            f"{div}/{len(prev_sent)} — cache hits up to there"
+                        )
+                    else:
+                        cache_expectation = "bust"
+                        _cache_stats["busts"] += 1
+                        log.warning(
+                            f"[CACHE] BUST: request diverges from last turn at "
+                            f"message {div}/{len(prev_sent)} with no compaction "
+                            f"to justify it — prompt cache will miss"
+                        )
+            _last_sent[convo_key] = sent_hashes
+            # Bounded: one entry per live transcript is small, but sessions
+            # accumulate over a long-running proxy.
+            while len(_last_sent) > 512:
+                _last_sent.pop(next(iter(_last_sent)))
+
         # Forward request — strip Accept-Encoding so we get plain text SSE
         body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body, strip_encoding=True)
@@ -917,8 +984,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             buffer = b""
             total_bytes = 0
             total_input = 0
+            cache_read = None  # None = usage didn't report a cache split
             while True:
-                chunk = resp.read(8192)
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -955,7 +1023,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             )
                             if tokens > 0:
                                 total_input = tokens
-                                log.info(f"[MSG] Input tokens from message_start: {total_input:,}")
+                                cache_read = usage.get("cache_read_input_tokens", 0)
+                                log.info(
+                                    f"[MSG] Input tokens from message_start: {total_input:,} "
+                                    f"(cache_read={cache_read:,} "
+                                    f"cache_create={usage.get('cache_creation_input_tokens', 0):,} "
+                                    f"fresh={usage.get('input_tokens', 0):,})"
+                                )
 
                         # Proxy/converter: usage in message_delta.usage (e.g. CodeGate)
                         elif evt_type == "message_delta":
@@ -983,7 +1057,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         + usage.get("cache_read_input_tokens", 0)
                     )
                     if total_input > 0:
-                        log.info(f"[MSG] Input tokens from response: {total_input:,}")
+                        cache_read = usage.get("cache_read_input_tokens", 0)
+                        log.info(
+                            f"[MSG] Input tokens from response: {total_input:,} "
+                            f"(cache_read={cache_read:,})"
+                        )
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse response for tokens: {e}")
 
@@ -995,6 +1073,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log.info(
                     f"[MSG] No tokens from SSE, estimating from chars: "
                     f"{msg_chars:,} chars -> ~{total_input:,} tokens"
+                )
+
+            # Sentinel verification: append-only requests must actually hit the
+            # cache. A zero cache_read on an expected hit means something
+            # between us and the tokens changed (headers, serialization, TTL
+            # expiry) — exactly the class of regression issue #1 was.
+            if (cache_expectation == "hit" and cache_read == 0
+                    and total_input > 10_000):
+                log.warning(
+                    f"[CACHE] expected a cache hit (append-only request) but "
+                    f"cache_read=0 on {total_input:,} input tokens — "
+                    f"cache miss with no rewrite to explain it"
                 )
 
             # Injection accounting (#8). Whether the proxy is actually doing its
