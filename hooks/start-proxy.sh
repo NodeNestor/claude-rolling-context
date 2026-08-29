@@ -35,103 +35,18 @@ PYTHON_CMD=$(_python)
 
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
-# Always update settings.json first (even if proxy is already running)
+# Wire ourselves into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate). CA
+# generation, HTTPS_PROXY single-owner ownership, chaining with pii-proxy,
+# plugin defaults and stale-base_url cleanup all live in wire.py — one tested
+# implementation shared with the PowerShell hook and with pii-proxy.
 SETTINGS_FILE="$HOME/.claude/settings.json"
-update_settings() {
-    $PYTHON_CMD - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
-import json, sys, os
-from urllib.parse import urlparse
-
-settings_file = sys.argv[1]
-proxy_url = sys.argv[2]
-
-settings = {}
-if os.path.exists(settings_file):
-    try:
-        # utf-8-sig, not the locale default: a UTF-8 BOM must not read as a
-        # corrupt file. On Windows the PowerShell hook wrote one, and git-bash
-        # shares the same $HOME, so this script saw a BOM'd file, called it
-        # unparseable, and rewrote it from {} below.
-        with open(settings_file, "r", encoding="utf-8-sig") as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, IOError, OSError, UnicodeDecodeError):
-        # Refuse to write. The file exists but we cannot read it, and
-        # regenerating it from {} would destroy the user's entire global
-        # config — permissions, hooks, enabledPlugins, theme, all of it.
-        # Losing the proxy chaining is recoverable; losing their settings
-        # is not.
-        print("unreadable")
-        sys.exit(0)
-
-if not isinstance(settings, dict):
-    print("unreadable")
-    sys.exit(0)
-
-if "env" not in settings or not isinstance(settings["env"], dict):
-    settings["env"] = {}
-
-env = settings["env"]
-
-# Set ANTHROPIC_BASE_URL
-def points_at_us(url):
-    """True only if url is OUR proxy — loopback AND our port.
-
-    Testing for the bare string "127.0.0.1" treated every LOCAL MODEL endpoint
-    as if it were the proxy already installed: Ollama on 11434, llama.cpp,
-    LM Studio on 1234, vLLM on 8000. Chaining was then skipped, so the plugin
-    sat there doing nothing for exactly the users the README tells to run local
-    models. The port is what distinguishes us; the host alone does not.
-    """
-    try:
-        u = urlparse(url if "://" in url else "http://" + url)
-        ours = urlparse(proxy_url)
-        return (u.hostname in ("127.0.0.1", "localhost", "::1")
-                and (u.port or 80) == (ours.port or 80))
-    except Exception:
-        return False
-
-
-existing = env.get("ANTHROPIC_BASE_URL", "")
-if not existing:
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print("set")
-elif not points_at_us(existing):
-    env["ROLLING_CONTEXT_UPSTREAM"] = existing
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print("chained")
-else:
-    print("already")
-
-# Set plugin config defaults (only if not already present)
-defaults = {
-    "ROLLING_CONTEXT_PORT": "5588",
-    "ROLLING_CONTEXT_TRIGGER": "100000",
-    "ROLLING_CONTEXT_TARGET": "40000",
-}
-for key, value in defaults.items():
-    if key not in env:
-        env[key] = value
-
-# Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
-# (prompt-cache hit). Migrate away the old seeded haiku default.
-if env.get("ROLLING_CONTEXT_MODEL") == "claude-haiku-4-5-20251001":
-    del env["ROLLING_CONTEXT_MODEL"]
-
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-PYEOF
-}
-
-RESULT=$(update_settings 2>/dev/null)
-case "$RESULT" in
-    set)     log "Set ANTHROPIC_BASE_URL=$PROXY_URL (settings.json)" ;;
-    chained) log "Chaining upstream (settings.json)" ;;
-    already) log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
-    unreadable)
-        log "WARNING: settings.json exists but could not be parsed — left untouched." ;;
-    *)       log "WARNING: Could not update settings.json" ;;
-esac
+WIRE_OUT=$($PYTHON_CMD "$PROXY_DIR/wire.py" --name rolling-context --settings "$SETTINGS_FILE" 2>&1)
+if [ $? -eq 0 ]; then
+    while IFS= read -r line; do [ -n "$line" ] && log "wire:$line"; done <<< "$WIRE_OUT"
+else
+    log "WARNING: wire.py failed to update settings.json: $WIRE_OUT"
+fi
 
 # Check if proxy is already running
 _kill_pid() {

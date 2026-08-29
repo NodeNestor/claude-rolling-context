@@ -36,65 +36,17 @@ function Test-PointsAtUs($url, $port) {
 
 Log "Hook started. ProxyDir=$ProxyDir"
 
-# Always update settings.json first (even if proxy is already running)
+# Wire ourselves into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+# ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate). All the
+# settings.json bookkeeping — CA generation, HTTPS_PROXY single-owner ownership,
+# chaining with pii-proxy, plugin defaults, stale-base_url cleanup — lives in
+# wire.py so it is one tested implementation shared with the sh hook and pii.
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
 try {
-    if (Test-Path $SettingsFile) {
-        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
-    } else {
-        $settings = [PSCustomObject]@{}
-    }
-
-    # Ensure env object exists
-    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
-        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
-    }
-
-    $existingUrl = $null
-    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-        $existingUrl = $settings.env.ANTHROPIC_BASE_URL
-    }
-
-    if (-not $existingUrl) {
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Log "Set ANTHROPIC_BASE_URL=$ProxyUrl (settings.json)"
-    } elseif (-not (Test-PointsAtUs $existingUrl $Port)) {
-        # Save existing URL as upstream
-        $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Log "Chaining: upstream=$existingUrl (settings.json)"
-    } else {
-        Log "ANTHROPIC_BASE_URL already set (settings.json)"
-    }
-
-    # Set plugin config defaults (only if not already present)
-    $defaults = @{
-        "ROLLING_CONTEXT_PORT"    = "5588"
-        "ROLLING_CONTEXT_TRIGGER" = "100000"
-        "ROLLING_CONTEXT_TARGET"  = "40000"
-    }
-    foreach ($key in $defaults.Keys) {
-        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
-            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
-        }
-    }
-    # Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
-    # (prompt-cache hit). Migrate away the old seeded haiku default.
-    if (($settings.env | Get-Member -Name "ROLLING_CONTEXT_MODEL" -MemberType NoteProperty) -and
-        $settings.env.ROLLING_CONTEXT_MODEL -eq "claude-haiku-4-5-20251001") {
-        $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_MODEL")
-    }
-
-    # NOT `Set-Content -Encoding UTF8`: on Windows PowerShell 5.1 that writes a
-    # UTF-8 BOM, which Python's json reader rejects. The proxy then lost the
-    # custom upstream (issues #3/#5 all over again), and the bash fallback hook
-    # read the same file, failed to parse it, and rewrote it from scratch —
-    # destroying permissions, hooks and enabledPlugins. Write BOM-less UTF-8
-    # explicitly; identical behaviour on 5.1 and 7+.
-    $json = $settings | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding $false))
+    $wireOut = & python (Join-Path $ProxyDir "wire.py") --name rolling-context --settings $SettingsFile 2>&1
+    foreach ($line in $wireOut) { Log "wire: $line" }
 } catch {
-    Log "WARNING: Could not update settings.json: $_"
+    Log "WARNING: wire.py failed to update settings.json: $_"
 }
 
 # --- Is the proxy actually SERVING? ------------------------------------------

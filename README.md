@@ -51,7 +51,7 @@ Claude Code re-sends the entire conversation on every turn. Even with caching wo
 ## How It Works
 
 ```
-Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Anthropic API
+Claude Code  ──HTTPS_PROXY──►  Rolling Context MITM (:5590)  ──►  core (:5588)  ──►  Anthropic API
                          │
                          ├─ context < 100K tokens? pass through unchanged
                          │
@@ -63,6 +63,8 @@ Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Anthropic API
                               3. inject compressed context on next request
                               4. never blocks, never adds latency
 ```
+
+**How it attaches:** the plugin sets `HTTPS_PROXY` (and `NODE_EXTRA_CA_CERTS`), not `ANTHROPIC_BASE_URL`. A non-anthropic `ANTHROPIC_BASE_URL` trips Claude Code's Remote Control / GrowthBook gate; routing through `HTTPS_PROXY` keeps the destination `api.anthropic.com`, so the gate stays untouched. A small MITM front-end terminates TLS with a locally generated CA (trusted via `NODE_EXTRA_CA_CERTS`) so bodies stay visible for compression; everything that is not `api.anthropic.com` (or your configured endpoint) is blind-tunnelled untouched.
 
 Instead of replacing everything, this plugin:
 
@@ -83,7 +85,7 @@ Run these two commands inside Claude Code:
 /plugin install rolling-context
 ```
 
-Restart your terminal and start a new Claude Code session. On the **first start**, the plugin configures `ANTHROPIC_BASE_URL` and starts the proxy. Since the env var only takes effect on the next terminal, **restart your terminal once more** — after that, everything works automatically. No pip install needed — pure Python stdlib.
+Restart your terminal and start a new Claude Code session. On the **first start**, the plugin configures `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` and starts the proxy. Since those env vars only take effect on the next terminal, **restart your terminal once more** — after that, everything works automatically. No pip install needed — pure Python stdlib (a local CA is generated with `cryptography`, which Claude Code already ships).
 
 ### Option 2: Manual install
 
@@ -101,7 +103,7 @@ cd $HOME\claude-rolling-context
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer configures `ANTHROPIC_BASE_URL` and registers the plugin. Restart your terminal and you're done. Requires Python 3.7+ (no pip install needed — pure stdlib).
+The installer configures `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` and registers the plugin. Restart your terminal and you're done. Requires Python 3.7+ (no pip install needed — pure stdlib).
 
 ## How Compression Works
 
@@ -165,9 +167,10 @@ export ROLLING_CONTEXT_MODEL=deepseek/deepseek-chat
 ### Non-Anthropic endpoints (GLM/Z.ai, DeepSeek, OpenRouter, a local gateway)
 
 Point Claude Code at your endpoint the usual way and install as normal. The hook
-chains it — `ANTHROPIC_BASE_URL` becomes the proxy, and your endpoint becomes
-`ROLLING_CONTEXT_UPSTREAM` — and **both** the chat traffic and the background
-compaction go there. No extra configuration.
+chains it — `ANTHROPIC_BASE_URL` stays your endpoint, the MITM front-end
+intercepts that host, and your endpoint is stored as `ROLLING_CONTEXT_UPSTREAM`
+— so **both** the chat traffic and the background compaction go there. No extra
+configuration.
 
 Third-party endpoints implement the `/v1/messages` shape to varying depth. Native
 mode clones the request Claude Code just sent, which can include `cache_control`
@@ -336,10 +339,10 @@ rm -f ~/.claude/rolling-context-proxy.log ~/.claude/rolling-context-debug.log
 Already using another proxy (model router, API gateway, etc.)? Rolling Context auto-detects this and chains through it:
 
 ```
-Claude Code  ──►  Rolling Context (:5588)  ──►  Your Proxy  ──►  Anthropic API
+Claude Code  ──HTTPS_PROXY──►  Rolling Context MITM (:5590)  ──►  core (:5588)  ──►  Your Proxy  ──►  Anthropic API
 ```
 
-If `ANTHROPIC_BASE_URL` is already set when you install, the plugin automatically saves it as `ROLLING_CONTEXT_UPSTREAM` and inserts itself in front. No manual config needed.
+If `ANTHROPIC_BASE_URL` is already set to a custom endpoint when you install, the plugin keeps it as the host Claude Code talks to, saves it as `ROLLING_CONTEXT_UPSTREAM`, and has the MITM front-end intercept that host too — so your endpoint is still reached and bodies are still rewritten. No manual config needed.
 
 You can also set it explicitly:
 ```bash

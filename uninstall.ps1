@@ -85,41 +85,21 @@ if (Test-Path $MarketplacesFile) {
     }
 }
 
-# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
+# Unwire from Claude Code settings.json — removes HTTPS_PROXY / chaining /
+# NODE_EXTRA_CA_CERTS (repairing the chain so pii-proxy keeps working if it is
+# still installed). One tested implementation in wire.py, shared with the sh
+# uninstaller.
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
+$ProxyDir = Join-Path $PSScriptRoot "proxy"
 if (Test-Path $SettingsFile) {
     try {
+        $out = & python (Join-Path $ProxyDir "wire.py") --name rolling-context --unwire --settings $SettingsFile 2>&1
+        foreach ($line in $out) { Write-Host "  $line" }
+        # Remove leftover plugin config knobs (routing keys are handled by wire).
         $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
-
         if ($settings | Get-Member -Name "env" -MemberType NoteProperty) {
-            $existingUrl = $null
-            $upstream = $null
-            if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-                $existingUrl = $settings.env.ANTHROPIC_BASE_URL
-            }
-            if ($settings.env | Get-Member -Name "ROLLING_CONTEXT_UPSTREAM" -MemberType NoteProperty) {
-                $upstream = $settings.env.ROLLING_CONTEXT_UPSTREAM
-            }
-
-            if ($existingUrl -and $existingUrl -match "127\.0\.0\.1") {
-                if ($upstream) {
-                    $settings.env.ANTHROPIC_BASE_URL = $upstream
-                    $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_UPSTREAM")
-                    Write-Host "Restored ANTHROPIC_BASE_URL to $upstream"
-                } else {
-                    $settings.env.PSObject.Properties.Remove("ANTHROPIC_BASE_URL")
-                    Write-Host "Removed ANTHROPIC_BASE_URL"
-                }
-            } elseif ($upstream) {
-                $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_UPSTREAM")
-            }
-
-            # Remove plugin config vars
             $toRemove = $settings.env.PSObject.Properties | Where-Object { $_.Name -like "ROLLING_CONTEXT_*" } | ForEach-Object { $_.Name }
-            foreach ($key in $toRemove) {
-                $settings.env.PSObject.Properties.Remove($key)
-            }
-
+            foreach ($key in $toRemove) { $settings.env.PSObject.Properties.Remove($key) }
             [System.IO.File]::WriteAllText($SettingsFile, ($settings | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding $false))
         }
     } catch {

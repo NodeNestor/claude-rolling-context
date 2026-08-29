@@ -22,64 +22,17 @@ try {
     exit 1
 }
 
-# 2. Configure ANTHROPIC_BASE_URL in Claude Code settings.json
+# 2. Wire into Claude Code via HTTPS_PROXY + NODE_EXTRA_CA_CERTS (NOT
+#    ANTHROPIC_BASE_URL, which trips the Remote Control / GrowthBook gate).
 Write-Host "[2/3] Configuring Claude Code settings.json..."
-$ProxyUrl = "http://127.0.0.1:$Port"
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
 if (-not (Test-Path $ClaudeDir)) {
     New-Item -ItemType Directory -Path $ClaudeDir -Force | Out-Null
 }
 
 try {
-    if (Test-Path $SettingsFile) {
-        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
-    } else {
-        $settings = [PSCustomObject]@{}
-    }
-
-    if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
-        $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
-    }
-
-    $existingUrl = $null
-    if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-        $existingUrl = $settings.env.ANTHROPIC_BASE_URL
-    }
-
-    if (-not $existingUrl) {
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Write-Host "  Set ANTHROPIC_BASE_URL=$ProxyUrl"
-    } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
-        $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Write-Host "  Chaining: ANTHROPIC_BASE_URL=$ProxyUrl -> upstream=$existingUrl"
-    } else {
-        Write-Host "  ANTHROPIC_BASE_URL already set"
-    }
-
-    # Set plugin config defaults (only if not already present)
-    $defaults = @{
-        "ROLLING_CONTEXT_PORT"    = "5588"
-        "ROLLING_CONTEXT_TRIGGER" = "100000"
-        "ROLLING_CONTEXT_TARGET"  = "40000"
-    }
-    foreach ($key in $defaults.Keys) {
-        if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
-            $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
-        }
-    }
-    # Unset ROLLING_CONTEXT_MODEL = compress with the session's own model
-    # (prompt-cache hit). Migrate away the old seeded haiku default.
-    if (($settings.env | Get-Member -Name "ROLLING_CONTEXT_MODEL" -MemberType NoteProperty) -and
-        $settings.env.ROLLING_CONTEXT_MODEL -eq "claude-haiku-4-5-20251001") {
-        $settings.env.PSObject.Properties.Remove("ROLLING_CONTEXT_MODEL")
-    }
-
-    # BOM-less: `Set-Content -Encoding UTF8` writes a BOM on Windows PowerShell
-    # 5.1, which Python's json reader rejects — that is the bug this release
-    # fixes, so the installer must not recreate it. See hooks/start-proxy.ps1.
-    $json = $settings | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding $false))
+    $wireOut = & python (Join-Path $ProxyDir "wire.py") --name rolling-context --settings $SettingsFile 2>&1
+    foreach ($line in $wireOut) { Write-Host "  $line" }
     Write-Host "  Settings written to $SettingsFile"
 } catch {
     Write-Host "  ERROR: Could not update settings.json: $_"

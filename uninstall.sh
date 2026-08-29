@@ -86,7 +86,10 @@ if 'rolling-context-marketplace' in data:
 "
 fi
 
-# Clean ANTHROPIC_BASE_URL from Claude Code settings.json
+# Unwire from Claude Code settings.json — removes HTTPS_PROXY / chaining /
+# NODE_EXTRA_CA_CERTS (repairing the chain so pii-proxy keeps working if it is
+# still installed). Shared, tested implementation in wire.py.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ]; then
     PY_CMD=""
@@ -94,47 +97,23 @@ if [ -f "$SETTINGS_FILE" ]; then
     elif command -v python &>/dev/null; then PY_CMD="python"
     fi
     if [ -n "$PY_CMD" ]; then
-        $PY_CMD - "$SETTINGS_FILE" <<'PYEOF'
-import json, sys, os
-
-settings_file = sys.argv[1]
+        "$PY_CMD" "$SCRIPT_DIR/proxy/wire.py" --name rolling-context --unwire --settings "$SETTINGS_FILE" || \
+            echo "WARNING: settings.json could not be cleaned — remove HTTPS_PROXY by hand."
+        # Remove leftover plugin config knobs (routing keys handled by wire.py).
+        "$PY_CMD" - "$SETTINGS_FILE" <<'PYEOF'
+import json, sys
+f = sys.argv[1]
 try:
-    # utf-8-sig: without it a BOM'd settings.json (every Windows install before
-    # v1.11.3) failed to parse here and the uninstall silently did nothing —
-    # leaving ANTHROPIC_BASE_URL pointed at a proxy that is about to stop
-    # existing, which breaks Claude Code entirely.
-    with open(settings_file, "r", encoding="utf-8-sig") as f:
-        settings = json.load(f)
-except (json.JSONDecodeError, IOError, OSError, UnicodeDecodeError):
-    print("WARNING: settings.json could not be parsed — ANTHROPIC_BASE_URL not cleaned.")
-    print("         Remove the 127.0.0.1 ANTHROPIC_BASE_URL entry by hand or Claude Code")
-    print("         will keep pointing at the removed proxy.")
+    with open(f, encoding="utf-8-sig") as fh:
+        s = json.load(fh)
+except Exception:
     sys.exit(0)
-
-env = settings.get("env", {})
-current = env.get("ANTHROPIC_BASE_URL", "")
-upstream = env.get("ROLLING_CONTEXT_UPSTREAM", "")
-
-if current and "127.0.0.1" in current:
-    if upstream:
-        env["ANTHROPIC_BASE_URL"] = upstream
-        del env["ROLLING_CONTEXT_UPSTREAM"]
-        print(f"Restored ANTHROPIC_BASE_URL to {upstream}")
-    else:
-        del env["ANTHROPIC_BASE_URL"]
-        print("Removed ANTHROPIC_BASE_URL")
-elif "ROLLING_CONTEXT_UPSTREAM" in env:
-    del env["ROLLING_CONTEXT_UPSTREAM"]
-
-# Remove plugin config vars
-for key in list(env.keys()):
-    if key.startswith("ROLLING_CONTEXT_"):
-        del env[key]
-
-settings["env"] = env
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
+env = s.get("env", {})
+for k in [k for k in env if k.startswith("ROLLING_CONTEXT_")]:
+    del env[k]
+s["env"] = env
+with open(f, "w", encoding="utf-8") as fh:
+    json.dump(s, fh, indent=2); fh.write("\n")
 PYEOF
     fi
 fi

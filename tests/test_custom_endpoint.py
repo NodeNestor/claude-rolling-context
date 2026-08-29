@@ -411,12 +411,18 @@ def uninstall_case(root):
 
 
 def preservation_cases(root):
-    failures = chaining_case(root, "hooks/start-proxy.sh", "hook", 0)
-    failures += chaining_case(root, "install.sh", "install", 1)
-    failures += local_endpoint_case(root, "hooks/start-proxy.sh", "hook")
-    failures += local_endpoint_case(root, "install.sh", "install")
-    failures += uninstall_case(root)
-    return failures
+    # The settings.json bookkeeping the hooks/install/uninstall scripts used to
+    # inline (ANTHROPIC_BASE_URL chaining) now lives in proxy/wire.py, which the
+    # scripts call. Its chaining/gateway/unwire behaviour — including "never
+    # destroy the user's config" — is covered by tests/test_wire.py. Run it here
+    # so this suite still gates that logic.
+    here = os.path.dirname(os.path.abspath(__file__))
+    rc = subprocess.run([sys.executable, os.path.join(here, "test_wire.py")],
+                        capture_output=True, text=True)
+    sys.stdout.write(rc.stdout)
+    if rc.returncode != 0:
+        sys.stdout.write(rc.stderr)
+    return 1 if rc.returncode != 0 else 0
 
 
 # ---------------------------------------------------------------- part D ----
