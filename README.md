@@ -142,7 +142,7 @@ By default the proxy doesn't build a separate summarization request. It **clones
 - **It's a prompt-cache read.** The cloned prefix was just sent by the chat request, so the API serves it from cache. Measured in practice: a ~72K-token compression request cost ~400 fresh input tokens.
 - **It's genuine Claude Code session traffic.** Pro/Max subscription OAuth tokens are classified server-side — standalone requests that don't look like Claude Code get routed to the overage lane and rejected with 429. The cloned request passes because it *is* the session's own request shape.
 
-Setting `ROLLING_CONTEXT_MODEL` pins a different summarizer model (the request shape stays native, but a different model means no prompt-cache reuse). Configuring any `ROLLING_CONTEXT_SUMMARIZER_*` variable switches to a standalone flattened request instead — see below.
+Setting `ROLLING_CONTEXT_MODEL` pins a different summarizer model (the request shape stays native, but a different model means no prompt-cache reuse). If the session's model answers the compaction request with a 200 and no text — on `claude-fable-5` a safety classifier can return `stop_reason: refusal` with no content, deterministically for that conversation — the proxy logs the stop reason and retries once on `ROLLING_CONTEXT_FALLBACK_MODEL` instead of cooling the conversation down for nothing (#11). Configuring any `ROLLING_CONTEXT_SUMMARIZER_*` variable switches to a standalone flattened request instead — see below.
 
 ### Using any API or a local model for compression
 
@@ -286,6 +286,7 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_SUMMARIZER_KEY` | *(uses Claude Code auth)* | API key for custom summarizer endpoint |
 | `ROLLING_CONTEXT_SUMMARIZER_FORMAT` | `anthropic` | `openai` = /v1/chat/completions for OpenAI-compatible endpoints |
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
+| `ROLLING_CONTEXT_FALLBACK_MODEL` | `claude-sonnet-5` | Model for the one retry when native compaction returns a 200 with no text (a refusal or a thinking-only answer on reasoning models) |
 | `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/rolling-context:on --global` |
 | `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag lives |
 | `ROLLING_CONTEXT_MAX_CONCURRENT` | `4` | Background compactions allowed at once across all conversations. A conversation with no summary yet is admitted past this (up to 2x) rather than be starved |

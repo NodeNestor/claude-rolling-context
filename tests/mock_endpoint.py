@@ -32,7 +32,8 @@ STRICT = os.environ.get("MOCK_STRICT") == "1"
 COMPACTION_DELAY = float(os.environ.get("MOCK_COMPACTION_DELAY", "0") or 0)
 TOKENS_FROM_SIZE = os.environ.get("MOCK_TOKENS_FROM_SIZE") == "1"
 
-COMPACTION_MARKER = "context compressor"
+# Native prompt carries the first, the flattened fallback prompt the second.
+COMPACTION_MARKERS = ("housekeeping request from me", "context compressor")
 SUMMARY_MARKER = "summary of our earlier conversation"
 
 
@@ -62,7 +63,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             payload = {}
         msgs = payload.get("messages") or []
-        is_compaction = COMPACTION_MARKER in (json.dumps(msgs[-1]) if msgs else "")
+        last = json.dumps(msgs[-1]) if msgs else ""
+        is_compaction = any(m in last for m in COMPACTION_MARKERS)
         reported_input = (max(1, len(json.dumps(msgs)) // 4) if TOKENS_FROM_SIZE
                           else BIG_INPUT)
 
