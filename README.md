@@ -377,6 +377,33 @@ proxy to answer before it exits, and says which of these happened:
 | `... is alive but is not our proxy — recycled PID` | Another process inherited the old PID. Left alone, proxy restarted. |
 | `port 5588 is held by something that is not this proxy` | Free that port, or set `ROLLING_CONTEXT_PORT`. |
 | `proxy did not answer on :5588 within ~8s` | It failed to start — see `~/.claude/rolling-context-proxy.log`. |
+| `Proxy vX is newer than this plugin` | A session on a newer plugin version already upgraded it. Left alone; never downgraded. |
+| `waiting for it to go idle before upgrading` | An older proxy has requests in flight; the hook waits up to ~6s. |
+| `Deferring upgrade: proxy vX still has N in flight` | It stayed busy. This session uses the old proxy; the upgrade happens at a later idle session start, or now via `/rolling-context:restart`. |
+
+### Upgrades never cut a running stream
+
+The proxy is shared by every Claude Code session on the machine. After a plugin
+auto-update, sessions started on the old version and sessions started on the
+new one each run the start hook from their own plugin cache directory. Up to
+v1.13.1 the hook restarted the proxy on *any* version difference, so the two
+cohorts took turns restarting it — and every restart dropped every session's
+in-flight `/v1/messages` stream as `API error` / `Connection dropped`
+(nestor-plugins issue #1, reported by @drewdrewthis: 188 such restarts in one
+log). Since v1.13.2:
+
+- **Never downgrade.** A running proxy of the same or a newer version is left alone.
+- **Upgrade only when idle.** `/health` reports `active_requests`; the hook waits
+  for it to reach zero (up to ~6s), and otherwise defers the upgrade to a later
+  session start rather than killing mid-stream. Proxies too old to report the
+  field are judged by their established client sockets instead.
+- **Drain on SIGTERM.** The proxy stops accepting, finishes what is in flight
+  (up to `ROLLING_CONTEXT_DRAIN_SECONDS`, default 20), then exits.
+- **`/rolling-context:restart`** forces a restart when you want the new version
+  now; it still waits briefly for in-flight requests.
+
+Sessions still running a pre-1.13.2 plugin keep the old "restart on any
+difference" hook, so the flapping stops fully once those sessions have ended.
 
 ## Debug
 

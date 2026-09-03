@@ -16,7 +16,9 @@ $CurrentVersion = if (Test-Path $PluginJson) { (Get-Content $PluginJson -Raw | C
 
 function Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $HookLog -Value "[$ts] $msg"
+    # UTF8 explicitly: Windows PowerShell 5.1 defaults Add-Content to the ANSI
+    # code page, which mangles the dashes in these messages for every other reader.
+    Add-Content -Path $HookLog -Value "[$ts] $msg" -Encoding UTF8
 }
 
 function Test-PointsAtUs($url, $port) {
@@ -66,6 +68,21 @@ function Get-ProxyState([string]$timeout = "2") {
 function Get-ProxyPid([string]$timeout = "2") {
     try { (& python $Probe $Port $timeout "pid" | Select-Object -First 1) } catch { "" }
 }
+function Get-Decision([string]$timeout = "2") {
+    # down | foreign | same | newer <v> | older <v> idle | older <v> busy <n> <how>
+    try { [string](& python $Probe $Port $timeout "decide" $CurrentVersion | Select-Object -First 1) } catch { "down" }
+}
+function Wait-UntilIdle([int]$budget) {
+    # Poll the decision until the running proxy has nothing in flight, for at
+    # most $budget seconds. Returns the final decision.
+    $deadline = (Get-Date).AddSeconds($budget)
+    while ($true) {
+        $d = Get-Decision "0.5"
+        if (-not ($d -like "older * busy *")) { return $d }
+        if ((Get-Date) -ge $deadline) { return $d }
+        Start-Sleep -Milliseconds 500
+    }
+}
 
 function Test-IsOurProxy($processId) {
     # Identity, not just liveness — never kill a process that merely inherited
@@ -99,12 +116,7 @@ function Clear-RecordedProxy([switch]$Serving) {
     Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
 }
 
-$state = Get-ProxyState 2
-if ($state -eq "ours $CurrentVersion") {
-    Log "Proxy already running and healthy on :$Port (v$CurrentVersion)"
-    exit 0
-} elseif ($state -like "ours *") {
-    Log "Version changed ($($state -replace '^ours ', '') -> $CurrentVersion), restarting proxy"
+function Replace-RunningProxy {
     Clear-RecordedProxy -Serving
     # The old proxy owns the port until it actually exits. Starting on top of
     # it would just lose the bind and leave the old version serving while the
@@ -119,7 +131,63 @@ if ($state -eq "ours $CurrentVersion") {
         Log "ERROR: the old proxy is still serving on :$Port and could not be stopped — not starting a second one."
         exit 0
     }
-} elseif ($state -eq "foreign") {
+}
+
+# The proxy is shared by every Claude Code session on this machine, and after
+# a plugin auto-update sessions on the old version and sessions on the new one
+# each run THIS hook from their own plugin cache dir. "Version differs, so
+# restart" made the two cohorts take turns killing the proxy, and every kill
+# cut every session's in-flight stream (nestor-plugins issue #1). Policy now:
+# never downgrade, and only replace an older proxy when nothing is in flight.
+# ROLLING_CONTEXT_FORCE_RESTART=1 (the /rolling-context:restart command)
+# restarts regardless of version, still waiting briefly for idle.
+$Force = [bool]$env:ROLLING_CONTEXT_FORCE_RESTART
+$decision = Get-Decision 2
+if ($decision -eq "same") {
+    if ($Force) {
+        $decision = Wait-UntilIdle 6
+        Log "Forced restart of v$CurrentVersion ($decision)"
+        Replace-RunningProxy
+    } else {
+        Log "Proxy already running and healthy on :$Port (v$CurrentVersion)"
+        exit 0
+    }
+} elseif ($decision -like "newer *") {
+    $running = $decision.Substring(6)
+    if ($Force) {
+        $decision = Wait-UntilIdle 6
+        Log "Forced restart: replacing v$running with v$CurrentVersion"
+        Replace-RunningProxy
+    } else {
+        Log "Proxy v$running on :$Port is newer than this plugin (v$CurrentVersion) — leaving it alone, never downgrading. This session uses it as is."
+        exit 0
+    }
+} elseif ($decision -like "older *") {
+    $parts = $decision -split " "   # older <v> idle | older <v> busy <n> <how>
+    $running = $parts[1]
+    if ($parts[2] -eq "busy") {
+        Log "Proxy v$running is older than v$CurrentVersion but has $($parts[3]) in flight ($($parts[4])) — waiting for it to go idle before upgrading"
+        $decision = Wait-UntilIdle 6
+        $parts = $decision -split " "
+    }
+    if ($decision -like "older *") {
+        if ($parts[2] -eq "busy" -and -not $Force) {
+            Log "Deferring upgrade: proxy v$running still has $($parts[3]) in flight ($($parts[4])). This session uses it as is; the upgrade to v$CurrentVersion happens at the next session start that finds it idle, or now via /rolling-context:restart."
+            exit 0
+        }
+        $how = if ($parts[2]) { $parts[2] } else { "idle" }
+        if ($Force) { $how = "$how, forced" }
+        Log "Upgrading proxy v$running -> v$CurrentVersion ($how)"
+        Replace-RunningProxy
+    } elseif ($decision -eq "same" -or $decision -like "newer *") {
+        # Someone else finished the upgrade while we waited.
+        Log "Proxy on :$Port was upgraded by another session while we waited ($decision)"
+        exit 0
+    } else {
+        Log "Proxy v$running went away while we waited ($decision); starting v$CurrentVersion"
+        Clear-RecordedProxy
+    }
+} elseif ($decision -eq "foreign") {
     # Starting here would only fail to bind, silently, forever. Say so.
     Log "ERROR: port $Port is held by something that is not this proxy — not starting. Free the port or set ROLLING_CONTEXT_PORT to another one."
     exit 0

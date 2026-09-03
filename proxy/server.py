@@ -87,6 +87,8 @@ LISTEN_PORT = endpoints.LISTEN_PORT
 # never trips Claude Code's Remote Control / GrowthBook gate. See mitm_frontend.
 MITM_PORT = int(os.environ.get("ROLLING_CONTEXT_MITM_PORT") or "5590")
 CA_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy-ca")
+# How long a SIGTERM waits for in-flight requests before the process exits.
+DRAIN_SECONDS = float(os.environ.get("ROLLING_CONTEXT_DRAIN_SECONDS") or "20")
 
 
 def _plugin_version() -> str:
@@ -108,6 +110,31 @@ def _plugin_version() -> str:
 
 
 VERSION = _plugin_version()
+
+# Requests this process is serving right now — the number the start hook asks
+# for before it decides to replace us on an upgrade. Killing a proxy that is
+# mid-stream cuts every open /v1/messages response in every session routed
+# through it (nestor-plugins issue #1). The hook waits for this to hit zero.
+_inflight = 0
+_inflight_lock = threading.Lock()
+_draining = False
+
+
+def _track_request(method):
+    """Run one BaseHTTPRequestHandler do_* body under the in-flight counter."""
+    def wrap(fn):
+        def inner(self):
+            global _inflight
+            with _inflight_lock:
+                _inflight += 1
+            try:
+                return fn(self)
+            finally:
+                with _inflight_lock:
+                    _inflight -= 1
+        inner.__name__ = fn.__name__
+        return inner
+    return wrap
 
 UPSTREAM_URL = endpoints.load_upstream(LISTEN_PORT)
 TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
@@ -660,8 +687,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         elif normalized_path == "/lean/status":
             self._handle_lean_status()
         else:
-            self._proxy_raw("GET")
+            self._tracked_get()
 
+    @_track_request("GET")
+    def _tracked_get(self):
+        self._proxy_raw("GET")
+
+    @_track_request("POST")
     def do_POST(self):
         log.info(f"[REQ] POST {self.path}")
         if self.path.startswith("/v1/messages"):
@@ -669,14 +701,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             self._proxy_raw("POST")
 
+    @_track_request("PUT")
     def do_PUT(self):
         log.info(f"[REQ] PUT {self.path}")
         self._proxy_raw("PUT")
 
+    @_track_request("DELETE")
     def do_DELETE(self):
         log.info(f"[REQ] DELETE {self.path}")
         self._proxy_raw("DELETE")
 
+    @_track_request("PATCH")
     def do_PATCH(self):
         log.info(f"[REQ] PATCH {self.path}")
         self._proxy_raw("PATCH")
@@ -756,6 +791,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
             "active_compressions": active,
+            # In-flight client requests (streams included). The start hook
+            # refuses to replace a proxy while this is non-zero.
+            "active_requests": _inflight,
+            "draining": _draining,
             "cache_integrity": dict(_cache_stats),
         }
         body = json.dumps(data).encode()
@@ -1258,11 +1297,46 @@ def main():
     except Exception as e:
         log.warning(f"MITM front-end disabled ({e!r}); HTTPS_PROXY entrypoint unavailable")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
+    def _drain_and_exit(reason):
+        # Stop taking new connections, let what is mid-flight finish, then
+        # leave. New sessions get ConnectionRefused for the second or two
+        # until the replacement binds — the SDK retries connection errors —
+        # whereas a stream cut in half is surfaced to the user as an API error.
+        global _draining
+        _draining = True
+        log.info(f"{reason}: draining {_inflight} in-flight request(s) (up to {DRAIN_SECONDS}s)")
+        try:
+            import mitm_frontend
+            mitm_frontend.close_listener()
+        except Exception:
+            pass
         server.shutdown()
+        deadline = time.time() + DRAIN_SECONDS
+        while _inflight > 0 and time.time() < deadline:
+            time.sleep(0.1)
+        log.info(f"Exiting with {_inflight} request(s) still open")
+        os._exit(0)
+
+    def _on_signal(signum, _frame):
+        # Never call server.shutdown() from the thread running serve_forever.
+        if _draining:
+            return
+        threading.Thread(target=_drain_and_exit, args=(f"Signal {signum}",),
+                         daemon=True).start()
+
+    import signal
+    for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _on_signal)
+            except (ValueError, OSError):
+                pass
+
+    server.serve_forever()
+    # serve_forever returns only when shutdown() was called: the drain thread
+    # owns the exit from here, so wait for it rather than falling off the end.
+    while True:
+        time.sleep(1)
 
 
 if __name__ == "__main__":

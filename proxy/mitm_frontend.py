@@ -216,10 +216,12 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
     if log:
         log(f"MITM front-end: CA at {ca_cert_path}, intercepting {sorted(hosts)}")
 
+    global _listener
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, mitm_port))
     srv.listen(128)
+    _listener = srv
     if log:
         log(f"MITM front-end listening on {host}:{mitm_port}")
 
@@ -251,8 +253,26 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
                 pass
 
     while True:
-        client, addr = srv.accept()
+        try:
+            client, addr = srv.accept()
+        except OSError:
+            # Listener closed by close_listener() during a drain.
+            return
         threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+
+
+_listener = None
+
+
+def close_listener():
+    """Stop accepting CONNECTs (drain). Established tunnels are untouched."""
+    global _listener
+    srv, _listener = _listener, None
+    if srv is not None:
+        try:
+            srv.close()
+        except OSError:
+            pass
 
 
 def start_in_thread(mitm_port: int, ca_dir: str, on_terminated, log=None,

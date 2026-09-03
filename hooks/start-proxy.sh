@@ -54,8 +54,13 @@ _kill_pid() {
     if [ "$IS_WINDOWS" = true ]; then
         powershell.exe -Command "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue" 2>/dev/null
     else
+        # TERM first: proxies from 1.13.2 on drain their in-flight requests
+        # before exiting. Escalate to KILL only once that grace is used up.
         kill "$pid" 2>/dev/null
-        sleep 1
+        local waited=0
+        while [ "$waited" -lt 24 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 0.25; waited=$((waited + 1))
+        done
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
     fi
 }
@@ -116,32 +121,104 @@ _probe_pid() {
     $PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" "${1:-2}" pid 2>/dev/null | tr -d '[:space:]'
 }
 
+_decide() {
+    # down | foreign | same | newer <v> | older <v> idle | older <v> busy <n> <how>
+    $PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" "${1:-2}" decide "$CURRENT_VERSION" 2>/dev/null
+}
+
+_wait_until_idle() {
+    # Poll the decision until the running proxy has nothing in flight, for
+    # at most $1 seconds. Prints the final decision.
+    local budget="$1" d
+    SECONDS=0
+    while :; do
+        d=$(_decide 0.5)
+        case "$d" in "older "*" busy "*) ;; *) break ;; esac
+        [ "$SECONDS" -ge "$budget" ] && break
+        sleep 0.5
+    done
+    echo "$d"
+}
+
+_replace_running_proxy() {
+    _clear_recorded_proxy serving
+    # The old proxy owns the port until it actually exits. Starting on top
+    # of it would just lose the bind and leave the old version serving
+    # while the log claimed a restart.
+    # Bounded by the clock, not by a probe count: each probe costs an
+    # interpreter start, and the SessionStart hook has 30s in total.
+    SECONDS=0
+    while [ "$SECONDS" -lt 5 ]; do
+        case "$(_probe 0.5)" in ours*) ;; *) return 0 ;; esac
+        sleep 0.25
+    done
+    case "$(_probe 0.5)" in
+        ours*)
+            log "ERROR: the old proxy is still serving on :$PORT and could not be stopped — not starting a second one."
+            exit 0
+            ;;
+    esac
+}
+
 # Ask the PORT, not the PID file. The PID file only records an intention to
 # run; the port is where "running" is either true or it is not. See probe.py
 # and issue #9 for the failure this replaces.
-PROBE=$(_probe 2)
-case "$PROBE" in
-    "ours $CURRENT_VERSION")
-        log "Proxy already running and healthy on :$PORT (v$CURRENT_VERSION)"
-        exit 0
+# The proxy is shared by every Claude Code session on this machine, and after
+# a plugin auto-update sessions on the old version and sessions on the new one
+# each run THIS hook from their own plugin cache dir. "Version differs, so
+# restart" made the two cohorts take turns killing the proxy, and every kill
+# cut every session's in-flight stream (nestor-plugins issue #1). Policy now:
+# never downgrade, and only replace an older proxy when nothing is in flight.
+# ROLLING_CONTEXT_FORCE_RESTART=1 (the /rolling-context:restart command)
+# restarts regardless of version, still waiting briefly for idle.
+FORCE="${ROLLING_CONTEXT_FORCE_RESTART:-}"
+DECISION=$(_decide 2)
+case "$DECISION" in
+    same)
+        if [ -n "$FORCE" ]; then
+            DECISION=$(_wait_until_idle 6)
+            log "Forced restart of v$CURRENT_VERSION (${DECISION})"
+            _replace_running_proxy
+        else
+            log "Proxy already running and healthy on :$PORT (v$CURRENT_VERSION)"
+            exit 0
+        fi
         ;;
-    ours*)
-        log "Version changed (${PROBE#ours } -> $CURRENT_VERSION), restarting proxy"
-        _clear_recorded_proxy serving
-        # The old proxy owns the port until it actually exits. Starting on top
-        # of it would just lose the bind and leave the old version serving
-        # while the log claimed a restart.
-        # Bounded by the clock, not by a probe count: each probe costs an
-        # interpreter start, and the SessionStart hook has 30s in total.
-        SECONDS=0
-        while [ "$SECONDS" -lt 5 ]; do
-            case "$(_probe 0.5)" in ours*) ;; *) break ;; esac
-            sleep 0.25
-        done
-        case "$(_probe 0.5)" in
-            ours*)
-                log "ERROR: the old proxy is still serving on :$PORT and could not be stopped — not starting a second one."
+    newer\ *)
+        if [ -n "$FORCE" ]; then
+            DECISION=$(_wait_until_idle 6)
+            log "Forced restart: replacing v${DECISION#newer } with v$CURRENT_VERSION"
+            _replace_running_proxy
+        else
+            log "Proxy v${DECISION#newer } on :$PORT is newer than this plugin (v$CURRENT_VERSION) — leaving it alone, never downgrading. This session uses it as is."
+            exit 0
+        fi
+        ;;
+    older\ *)
+        set -- $DECISION   # older <v> idle | older <v> busy <n> <how>
+        RUNNING="$2"
+        if [ "$3" = "busy" ]; then
+            log "Proxy v$RUNNING is older than v$CURRENT_VERSION but has $4 in flight ($5) — waiting for it to go idle before upgrading"
+            DECISION=$(_wait_until_idle 6)
+            set -- $DECISION
+        fi
+        case "$DECISION" in
+            "older "*" idle"|"older "*" busy "*)
+                if [ "$3" = "busy" ] && [ -z "$FORCE" ]; then
+                    log "Deferring upgrade: proxy v$RUNNING still has $4 in flight ($5). This session uses it as is; the upgrade to v$CURRENT_VERSION happens at the next session start that finds it idle, or now via /rolling-context:restart."
+                    exit 0
+                fi
+                log "Upgrading proxy v$RUNNING -> v$CURRENT_VERSION (${3:-idle}${FORCE:+, forced})"
+                _replace_running_proxy
+                ;;
+            same|newer\ *)
+                # Someone else finished the upgrade while we waited.
+                log "Proxy on :$PORT was upgraded by another session while we waited ($DECISION)"
                 exit 0
+                ;;
+            *)
+                log "Proxy v$RUNNING went away while we waited ($DECISION); starting v$CURRENT_VERSION"
+                _clear_recorded_proxy
                 ;;
         esac
         ;;
