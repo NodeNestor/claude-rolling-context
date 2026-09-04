@@ -11,6 +11,7 @@ compressed (issue #5). Both now resolve through here.
 import json
 import logging
 import os
+import ssl
 from urllib.parse import urlparse
 
 log = logging.getLogger("rolling-context.endpoints")
@@ -18,6 +19,53 @@ log = logging.getLogger("rolling-context.endpoints")
 DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
 LISTEN_PORT = int(os.environ.get("ROLLING_CONTEXT_PORT") or "5588")
+
+
+def outbound_ssl_context() -> ssl.SSLContext:
+    """SSL context for the proxy's OUTBOUND TLS to the upstream.
+
+    ``ssl.create_default_context()`` trusts only the host's OS CA store, which on
+    some Python installs is empty — notably a python.org macOS build where
+    ``Install Certificates.command`` was never run: the ``etc/openssl/cert.pem``
+    symlink is absent, the context loads zero roots, and every upstream handshake
+    fails ``CERTIFICATE_VERIFY_FAILED``. Claude Code surfaces that as an opaque
+    502 that reads exactly like an Anthropic outage (issue #13). certifi ships a
+    CA bundle; add it so verification works regardless of the OS setup. This is a
+    union (``load_verify_locations`` adds roots), so OS and corporate roots stay
+    trusted too. certifi is optional (the proxy targets stdlib) — if it is not
+    importable we keep the OS store and warn when it is empty, so the failure is
+    diagnosable instead of silent.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception as e:  # noqa: BLE001 - certifi missing/broken is non-fatal
+        log.warning("certifi CA bundle unavailable (%s); trusting only the OS CA "
+                    "store for upstream TLS.", e)
+    try:
+        if ctx.cert_store_stats().get("x509_ca", 0) == 0:
+            log.warning("Outbound TLS trust store is EMPTY: no OS CA bundle and no "
+                        "certifi. Upstream requests will fail CERTIFICATE_VERIFY_FAILED "
+                        "(this is the PROXY's TLS, not an Anthropic outage). Fix: "
+                        "`pip install certifi`, or run this Python's "
+                        "Install Certificates.command, then restart the proxy.")
+    except Exception:  # noqa: BLE001 - cert_store_stats is best-effort
+        pass
+    return ctx
+
+
+def annotate_upstream_tls_error(err) -> str:
+    """If `err` is an outbound cert-verification failure, append the actionable
+    cause so a viewer does not mistake it for an Anthropic-side 502 (issue #13)."""
+    s = str(err)
+    if isinstance(err, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in s:
+        return (s + " -- this is the rolling-context proxy's OWN outbound TLS to the "
+                "upstream failing certificate verification, NOT an Anthropic outage. "
+                "The Python running the proxy has no usable CA bundle. Fix: "
+                "`pip install certifi` (or run this Python's Install "
+                "Certificates.command), then restart the proxy.")
+    return s
 
 
 def settings_env() -> dict:

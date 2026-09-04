@@ -429,6 +429,21 @@ v1.13.3:
   `TLSV1_ALERT_UNKNOWN_CA` handshake failure now says the client was started
   before `NODE_EXTRA_CA_CERTS` was wired in and should be restarted.
 
+### `502 CERTIFICATE_VERIFY_FAILED` is the proxy's own TLS, not an outage
+
+The proxy verifies its **outbound** TLS to `api.anthropic.com` against the host
+Python's CA store. On some installs that store is empty — notably a python.org
+macOS build where `Install Certificates.command` was never run — so every
+forwarded request failed `CERTIFICATE_VERIFY_FAILED`, surfaced to Claude Code as
+an opaque `502` that reads exactly like an Anthropic outage (issue #13,
+@drewdrewthis). Since v1.13.4 the outbound context loads the bundled **certifi**
+roots in addition to the OS store (a union, so corporate roots stay trusted), so
+verification works regardless of whether the OS cert-setup step was ever run. If
+certifi is not importable and the OS store is also empty, the proxy logs an
+actionable warning and the `502` body now names the real cause (run
+`pip install certifi` or the Python installer's `Install Certificates.command`,
+then restart the proxy) instead of passing through a bare SSL error.
+
 ## Debug
 
 ```bash

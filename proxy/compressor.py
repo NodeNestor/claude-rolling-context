@@ -63,7 +63,7 @@ LEGACY_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 # is still far cheaper than a session that never compresses again.
 FALLBACK_MODEL = os.environ.get("ROLLING_CONTEXT_FALLBACK_MODEL") or "claude-sonnet-5"
 
-ssl_ctx = ssl.create_default_context()
+ssl_ctx = endpoints.outbound_ssl_context()
 
 _parsed_summarizer = urlparse(SUMMARIZER_BASE_URL)
 _SUMMARIZER_HOST = _parsed_summarizer.hostname

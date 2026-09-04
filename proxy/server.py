@@ -155,7 +155,7 @@ FAILURE_COOLDOWN = int(os.environ.get("ROLLING_CONTEXT_FAILURE_COOLDOWN") or "30
 MAX_CONCURRENT_COMPACTIONS = max(
     1, int(os.environ.get("ROLLING_CONTEXT_MAX_CONCURRENT") or "4"))
 
-ssl_ctx = ssl.create_default_context()
+ssl_ctx = endpoints.outbound_ssl_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
 UPSTREAM_PATH = _parsed_upstream.path or ""
 
@@ -669,7 +669,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
         except Exception as e:
             log.error(f"[RAW] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": str(e)}).encode()
+            error_body = json.dumps({"error": endpoints.annotate_upstream_tls_error(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
@@ -1227,7 +1227,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": str(e)}).encode()
+            error_body = json.dumps({"error": endpoints.annotate_upstream_tls_error(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
