@@ -144,19 +144,38 @@ def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
 # CONNECT proxy
 # --------------------------------------------------------------------------
 def _read_connect_line(sock: socket.socket):
-    """Read the CONNECT request line + headers. Returns (host, port) or None."""
+    """Read the CONNECT request line + headers.
+
+    Returns ``(host, port)`` on success, or ``(None, reason)`` — a short human
+    reason the front-end can log — so a connection we close before a usable
+    CONNECT is never dropped silently (issue #12: a running session flipped onto
+    a transport it could not satisfy hit this path and the proxy logged nothing).
+    """
+    tls_hello = ("client spoke TLS directly to the proxy port "
+                 "(HTTPS_PROXY must be an http:// URL, not https://)")
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
         if not chunk:
-            return None
+            if not buf:
+                return None, "client closed before sending any request"
+            if buf[:1] == b"\x16":
+                return None, tls_hello
+            return None, ("client closed mid-request after "
+                          f"{len(buf)} bytes, no header terminator")
         buf += chunk
+        # A TLS ClientHello (HTTPS_PROXY set to an https:// URL, or a client that
+        # speaks TLS to the proxy) starts with the 0x16 handshake record byte and
+        # never carries a CRLF header terminator — catch it before we block for
+        # one. It is the common misconfiguration; say so instead of timing out.
+        if buf[:1] == b"\x16":
+            return None, tls_hello
         if len(buf) > 65536:
-            return None
+            return None, "request headers exceeded 64 KiB without a CONNECT"
     first = buf.split(b"\r\n", 1)[0].decode("latin1", "replace")
     parts = first.split(" ")
     if len(parts) < 2 or parts[0].upper() != "CONNECT":
-        return None
+        return None, f"first line was not a CONNECT: {first[:80]!r}"
     hostport = parts[1]
     host, _, port = hostport.partition(":")
     return host, int(port or "443")
@@ -226,19 +245,29 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
         log(f"MITM front-end listening on {host}:{mitm_port}")
 
     def handle(client, addr):
+        peer = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) >= 2 else str(addr)
         try:
-            target = _read_connect_line(client)
-            if target is None:
+            thost, tport = _read_connect_line(client)
+            if thost is None:
+                # tport carries the reason string. Never close silently — a
+                # stranded session (issue #12) reaches exactly here.
+                if log:
+                    log(f"MITM: closed {peer} before a usable CONNECT - {tport}")
                 client.close()
                 return
-            thost, tport = target
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if thost.lower() in hosts:
                 try:
                     tls = ctx.wrap_socket(client, server_side=True)
                 except ssl.SSLError as e:
                     if log:
-                        log(f"TLS handshake failed for {thost}: {e}")
+                        hint = ""
+                        if "UNKNOWN_CA" in str(e) or "unknown ca" in str(e).lower():
+                            hint = (" - the client does not trust our MITM CA; "
+                                    "it was almost certainly started before "
+                                    "NODE_EXTRA_CA_CERTS was wired in, so restart "
+                                    "or --resume that session")
+                        log(f"TLS handshake failed for {thost} from {peer}: {e}{hint}")
                     client.close()
                     return
                 on_terminated(tls, addr, thost)

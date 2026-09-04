@@ -292,6 +292,55 @@ def unwire_env(name: str, env: dict, ca_cert_path: str, notes=None) -> dict:
     return env
 
 
+def _reaches_via_our_mitm(env: dict, my_mitm_port: int) -> bool:
+    """True if this env sends api.anthropic.com through our MITM AND carries a
+    CA — i.e. a process launched with it can complete the intercepted TLS.
+
+    The distinction that matters for issue #12: NODE_EXTRA_CA_CERTS is read once,
+    at process launch. A running session that lacked it cannot be made to trust
+    the MITM cert by a later settings rewrite — its every request would reset.
+    """
+    if not (env.get("NODE_EXTRA_CA_CERTS") or "").strip():
+        return False
+    return _url_port((env.get("HTTPS_PROXY") or "").strip()) == my_mitm_port
+
+
+def _established_client_sockets(ports) -> int:
+    """Count ESTABLISHED TCP connections whose local side is one of `ports`.
+
+    A running session talking to us shows up as ESTABLISHED on our listening
+    port. Self-contained (this module stays import-light) mirror of the same
+    check in probe.py. Returns 0 when netstat/ss is unavailable — never blocks
+    wiring on a machine we cannot inspect.
+    """
+    import re
+    import subprocess
+
+    want = {str(p) for p in ports}
+    out = None
+    for cmd in (["netstat", "-an"], ["ss", "-tan"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.stdout:
+                out = r.stdout
+                break
+        except Exception:
+            continue
+    if not out:
+        return 0
+    n = 0
+    for line in out.splitlines():
+        if "ESTAB" not in line.upper():
+            continue
+        for col in line.split():
+            m = re.search(r"[:.](\d+)$", col)
+            if m:
+                if m.group(1) in want:
+                    n += 1
+                break
+    return n
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Wire a body-rewriting proxy into Claude Code via HTTPS_PROXY")
     ap.add_argument("--name", required=True, choices=list(PROXIES))
@@ -312,9 +361,47 @@ def main() -> int:
     notes: list[str] = []
     if args.unwire:
         unwire_env(args.name, env, ca_cert_path, notes)
+        _write_settings(args.settings, settings)
     else:
-        wire_env(args.name, env, ca_cert_path, notes)
-    _write_settings(args.settings, settings)
+        import copy
+
+        me = PROXIES[args.name]
+        my_mitm_port = _port(env, me["mitm"])
+        my_core_port = _port(env, me["core"])
+
+        before = copy.deepcopy(env)
+        after = wire_env(args.name, env, ca_cert_path, notes)
+
+        # Issue #12: this rewrite would flip the transport onto our MITM, but the
+        # env before it could not reach us that way. Claude Code live-reloads the
+        # settings `env` into ALREADY-RUNNING sessions; those processes fixed
+        # their CA trust at launch and cannot start trusting the MITM cert now,
+        # so each would reset on every request until restarted. If any session is
+        # currently established on our ports, defer the flip to a later session
+        # start when nothing is live to be stranded. New sessions keep working on
+        # the transport already in the file (the core port still listens).
+        flip = _reaches_via_our_mitm(after, my_mitm_port) and not _reaches_via_our_mitm(before, my_mitm_port)
+        forced = (os.environ.get("ROLLING_CONTEXT_FORCE_WIRE") or "").strip() not in ("", "0")
+        if flip and not forced:
+            live = _established_client_sockets({my_core_port, my_mitm_port})
+            if live > 0:
+                settings["env"] = before
+                notes = [
+                    f"DEFERRED transport change: {live} running session(s) are "
+                    f"connected on ports {my_core_port}/{my_mitm_port}. Flipping "
+                    "them onto the MITM now would strand them (their CA trust is "
+                    "fixed at launch) — they would ECONNRESET every request until "
+                    "restarted. Left settings.json unchanged; the flip happens on "
+                    "a later session start once they have drained. Set "
+                    "ROLLING_CONTEXT_FORCE_WIRE=1 to override, then restart or "
+                    "--resume any old sessions.",
+                ]
+                _write_settings(args.settings, settings)
+                if not args.quiet:
+                    for n in notes:
+                        print(f"  {n}")
+                return 0
+        _write_settings(args.settings, settings)
 
     if not args.quiet:
         for n in notes:

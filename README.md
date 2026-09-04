@@ -405,6 +405,30 @@ log). Since v1.13.2:
 Sessions still running a pre-1.13.2 plugin keep the old "restart on any
 difference" hook, so the flapping stops fully once those sessions have ended.
 
+### A transport change never strands a running session
+
+Claude Code live-reloads the `env` block of `settings.json` into
+**already-running** sessions. `NODE_EXTRA_CA_CERTS`, though, is read once at
+process launch: a session started before it was wired in can never be made to
+trust the MITM cert by a later rewrite. So flipping a running session from the
+old `ANTHROPIC_BASE_URL` transport onto `HTTPS_PROXY` + MITM used to break it —
+every request reset with `Connection dropped (ECONNRESET)` until the session was
+restarted, and the front-end logged nothing (issue #12, @drewdrewthis). Since
+v1.13.3:
+
+- **The flip waits for idle.** If any session is established on the proxy ports
+  when the start hook would flip the transport onto the MITM, the hook leaves
+  `settings.json` unchanged and logs `DEFERRED transport change`. Running
+  sessions keep working on the transport already in the file (the core port
+  still listens); the flip happens at a later session start once they drain.
+  `ROLLING_CONTEXT_FORCE_WIRE=1` overrides it — then restart or `--resume` the
+  old sessions.
+- **No connection is dropped silently.** The MITM front-end now logs every
+  connection it closes before a usable `CONNECT` — an empty connection, a client
+  that spoke TLS straight at the proxy port, a non-`CONNECT` request — and a
+  `TLSV1_ALERT_UNKNOWN_CA` handshake failure now says the client was started
+  before `NODE_EXTRA_CA_CERTS` was wired in and should be restarted.
+
 ## Debug
 
 ```bash
